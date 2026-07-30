@@ -1,6 +1,7 @@
+import os
 import sqlite3
 
-from conftest import EXPECT, approx, node_id_for, run_duh
+from conftest import EXPECT, MiB, Scanned, approx, node_id_for, run_duh
 
 
 def freeable_of(scanned, path):
@@ -49,3 +50,29 @@ def test_root_freeable_counts_each_family_once(scanned):
 def test_freeable_cli_output_shape(scanned):
     out = run_duh("freeable", scanned.root / "unique", db=scanned.db).stdout
     assert "Freeable:" in out and "Locked here:" in out
+
+
+def test_rescan_invalidates_freeable_cache(tmp_path):
+    """Regression: the Python predecessor's `--rescan` reused the scans rowid,
+    so month-old freeable_cache rows passed the scan_id validity check and
+    `freeable` served stale numbers. Any completed scan must wipe the cache
+    and the next `freeable` must reflect post-rescan reality."""
+    root = tmp_path / "tree"
+    (root / "sub").mkdir(parents=True)
+    (root / "a.bin").write_bytes(os.urandom(2 * MiB))
+    db = tmp_path / "scan.db"
+    scanned = Scanned(db=db, root=root)
+
+    run_duh("scan", root, "-q", db=db)
+    f_before, _ = freeable_of(scanned, root)  # populates the cache
+    assert approx(f_before, 2 * MiB)
+    assert sqlite3.connect(db).execute(
+        "SELECT COUNT(*) FROM freeable_cache").fetchone()[0] > 0
+
+    (root / "sub/b.bin").write_bytes(os.urandom(3 * MiB))
+    run_duh("scan", root, "--rescan", "-q", db=db)
+    assert sqlite3.connect(db).execute(
+        "SELECT COUNT(*) FROM freeable_cache").fetchone()[0] == 0  # cache wiped
+
+    f_after, _ = freeable_of(scanned, root)  # fresh compute, not stale cache
+    assert approx(f_after, 5 * MiB)
