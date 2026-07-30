@@ -1,6 +1,7 @@
+import os
 import sqlite3
 
-from conftest import EXPECT, approx, node_id_for
+from conftest import EXPECT, MiB, approx, node_id_for, run_duh
 
 
 def _con(scanned):
@@ -82,3 +83,64 @@ def test_adjacency_is_consistent(scanned):
           AND NOT EXISTS (SELECT 1 FROM files p WHERE p.id = f.parent_id)
     """).fetchone()[0]
     assert orphans == 0
+
+
+# ---------------------------------------------------------------------------
+# Overlap guard: a DB holding two scans whose roots nest indexes the same
+# physical files twice, giving clone/hardlink families phantom members and
+# collapsing `freeable` to nonsense. `scan` must refuse such roots.
+# ---------------------------------------------------------------------------
+
+def _overlap_tree(tmp_path):
+    root = tmp_path / "outer"
+    (root / "inner").mkdir(parents=True)
+    (root / "inner/f.bin").write_bytes(os.urandom(1 * MiB))
+    return root
+
+
+def _scan_roots(db):
+    return [r[0] for r in sqlite3.connect(db).execute("SELECT root FROM scans")]
+
+
+def test_scan_refuses_nested_root(tmp_path):
+    root = _overlap_tree(tmp_path)
+    db = tmp_path / "scan.db"
+    run_duh("scan", root, "-q", db=db)
+    for conflicting in (root / "inner", root, tmp_path):  # child, equal, parent
+        r = run_duh("scan", conflicting, "-q", db=db, check=False)
+        assert r.returncode != 0, conflicting
+        assert "overlap" in r.stderr, r.stderr
+    assert _scan_roots(db) == [str(root)]  # refused scans left no rows
+
+
+def test_scan_overlap_is_by_component_not_string_prefix(tmp_path):
+    cha, chang = tmp_path / "cha", tmp_path / "chang"
+    for d in (cha, chang):
+        d.mkdir()
+        (d / "f.bin").write_bytes(os.urandom(1 * MiB))
+    db = tmp_path / "scan.db"
+    run_duh("scan", cha, "-q", db=db)
+    run_duh("scan", chang, "-q", db=db)  # sibling: not a conflict
+    assert sorted(_scan_roots(db)) == [str(cha), str(chang)]
+
+
+def test_rescan_same_root_unaffected_by_overlap_guard(tmp_path):
+    root = _overlap_tree(tmp_path)
+    db = tmp_path / "scan.db"
+    run_duh("scan", root, "-q", db=db)
+    run_duh("scan", root, "--rescan", "-q", db=db)
+    assert _scan_roots(db) == [str(root)]
+
+
+def test_replace_overlapping_evicts_conflicting_scan(tmp_path):
+    root = _overlap_tree(tmp_path)
+    db = tmp_path / "scan.db"
+    run_duh("scan", root, "-q", db=db)
+    run_duh("scan", root / "inner", "--replace-overlapping", "-q", db=db)
+    con = sqlite3.connect(db)
+    scans = con.execute("SELECT id, root FROM scans").fetchall()
+    assert [r[1] for r in scans] == [str(root / "inner")]
+    # every surviving row belongs to the surviving scan
+    stray = con.execute(
+        "SELECT COUNT(*) FROM files WHERE scan_id != ?", (scans[0][0],)).fetchone()[0]
+    assert stray == 0

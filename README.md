@@ -123,6 +123,12 @@ Useful knobs:
   nearly-full disk.
 - The database lives at `~/.local/share/duh/scan.db`; override with the
   `DUH_DB` environment variable or `--db`.
+- One database holds at most one scan per subtree: scanning a root that
+  contains, equals, or is contained by an already-scanned root is refused,
+  because indexing the same files twice poisons clone/hardlink analysis and
+  wrecks `freeable`. Use `--rescan` to redo the same root,
+  `--replace-overlapping` to evict the conflicting scan(s), or a separate
+  database. Sibling roots coexist fine.
 
 Other subcommands: `marginal PATH`, `file PATH`, `stats`, and `sql` (opens
 the database in `sqlite3` with convenience views).

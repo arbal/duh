@@ -41,7 +41,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -67,6 +67,7 @@ pub struct ScanArgs {
     pub quiet: bool,
     pub no_clones: bool,
     pub rescan: bool,
+    pub replace_overlapping: bool,
     pub cross_device: bool,
     pub min_free: f64,
     pub exclude: Vec<String>,
@@ -189,6 +190,28 @@ pub(crate) fn realpath(p: &Path) -> PathBuf {
             None => return abs,
         }
     }
+}
+
+/// True when one root contains the other (or they are equal), compared by path
+/// components — NOT by string prefix, so `/Users/cha` does not "contain"
+/// `/Users/chang`. Both sides are canonical absolute paths (`realpath` output at
+/// scan time), so no normalization is needed here.
+fn roots_overlap(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+/// Delete every row belonging to scan `sid`: excluded_families BEFORE files (FK),
+/// then files, freeable_cache, and the scans row itself.
+fn delete_scan_rows(con: &Connection, sid: i64) -> rusqlite::Result<()> {
+    con.execute(
+        "DELETE FROM excluded_families WHERE excluded_id IN \
+         (SELECT id FROM files WHERE scan_id = ?)",
+        rusqlite::params![sid],
+    )?;
+    con.execute("DELETE FROM files WHERE scan_id = ?", rusqlite::params![sid])?;
+    con.execute("DELETE FROM freeable_cache WHERE scan_id = ?", rusqlite::params![sid])?;
+    con.execute("DELETE FROM scans WHERE id = ?", rusqlite::params![sid])?;
+    Ok(())
 }
 
 /// Per-clone-family accumulator for an excluded subtree: [count, blocks_sum, max_blocks].
@@ -744,6 +767,54 @@ fn run_inner(
 ) -> rusqlite::Result<ExitCode> {
     let root_bytes = root.as_os_str().as_bytes();
 
+    // Overlap guard: an existing scan whose root contains, equals, or is
+    // contained by the new root would leave the same physical files indexed
+    // twice. Clone/hardlink family analysis then sees phantom duplicate members,
+    // families appear to extend outside every queried subtree, and `freeable`
+    // collapses to nonsense. Refuse unless the caller opts into a resolution.
+    let overlapping: Vec<(i64, PathBuf)> = {
+        // CAST to BLOB: roots are stored as TEXT holding raw path bytes (see
+        // RawText), and rusqlite only maps BLOB columns to Vec<u8>.
+        let mut stmt = con.prepare("SELECT id, CAST(root AS BLOB) FROM scans")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|(sid, raw)| (sid, PathBuf::from(std::ffi::OsString::from_vec(raw))))
+            // --rescan of the SAME canonical root keeps its semantics: those
+            // rows are deleted by the rescan block below, not a conflict.
+            .filter(|(_, r)| roots_overlap(r, root) && !(args.rescan && r == root))
+            .collect()
+    };
+    if !overlapping.is_empty() {
+        if args.replace_overlapping {
+            for (sid, r) in &overlapping {
+                delete_scan_rows(&con, *sid)?;
+                eprintln!(
+                    "[scan] --replace-overlapping: deleted scan #{sid} ({})",
+                    r.display()
+                );
+            }
+        } else {
+            eprintln!("error: refusing to scan {}:", root.display());
+            for (sid, r) in &overlapping {
+                eprintln!("  overlaps existing scan #{sid} with root {}", r.display());
+            }
+            eprintln!(
+                "\n\
+                 Overlapping scan roots index the same physical files twice, which\n\
+                 poisons clone/hardlink family analysis: every family gains phantom\n\
+                 duplicate members outside the queried subtree and `freeable` reports\n\
+                 nonsense. Options:\n\
+                 \x20 - rescan the existing root instead:   duh scan --rescan <existing root>\n\
+                 \x20 - use a separate database:            duh --db <path> scan ... (or DUH_DB)\n\
+                 \x20 - replace the overlapping scan(s):    duh scan --replace-overlapping <new root>"
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+
     // --rescan: delete prior rows for this root. excluded_families BEFORE files
     // (FK), then files, then the scans row (reference/duh-py:550-565).
     if args.rescan {
@@ -753,17 +824,8 @@ fn run_inner(
             rows.collect::<rusqlite::Result<Vec<i64>>>()?
         };
         for sid in old_ids {
-            con.execute(
-                "DELETE FROM excluded_families WHERE excluded_id IN \
-                 (SELECT id FROM files WHERE scan_id = ?)",
-                rusqlite::params![sid],
-            )?;
-            con.execute("DELETE FROM files WHERE scan_id = ?", rusqlite::params![sid])?;
+            delete_scan_rows(&con, sid)?;
         }
-        con.execute(
-            "DELETE FROM scans WHERE root = ?",
-            rusqlite::params![RawText(root_bytes)],
-        )?;
         eprintln!("[rescan] deleted existing scan rows for {}", root.display());
     }
 
@@ -949,7 +1011,24 @@ fn run_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::fmt_thousands;
+    use super::{fmt_thousands, roots_overlap};
+    use std::path::Path;
+
+    /// Overlap is component-wise containment (either direction), never naive
+    /// string-prefix matching.
+    #[test]
+    fn roots_overlap_compares_path_components() {
+        // equal
+        assert!(roots_overlap(Path::new("/Users/chang"), Path::new("/Users/chang")));
+        // containment, both directions
+        assert!(roots_overlap(Path::new("/System/Volumes/Data"), Path::new("/System/Volumes/Data/Users")));
+        assert!(roots_overlap(Path::new("/Users/chang/projects"), Path::new("/Users/chang")));
+        // string prefix but NOT a path prefix
+        assert!(!roots_overlap(Path::new("/Users/cha"), Path::new("/Users/chang")));
+        assert!(!roots_overlap(Path::new("/Users/chang"), Path::new("/Users/cha")));
+        // siblings
+        assert!(!roots_overlap(Path::new("/Users/chang/a"), Path::new("/Users/chang/b")));
+    }
 
     /// Pin parity with Python's `{n:,}` formatting (used at reference/duh-py:780,822,829).
     #[test]

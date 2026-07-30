@@ -34,6 +34,9 @@ enum Command {
         /// Delete existing scan for this root before scanning
         #[arg(long)]
         rescan: bool,
+        /// Delete any existing scans whose root overlaps this one before scanning
+        #[arg(long)]
+        replace_overlapping: bool,
         /// Follow mounts into other filesystems
         #[arg(long)]
         cross_device: bool,
@@ -146,6 +149,7 @@ fn main() -> ExitCode {
             quiet,
             no_clones,
             rescan,
+            replace_overlapping,
             cross_device,
             min_free,
             exclude,
@@ -157,6 +161,7 @@ fn main() -> ExitCode {
                 quiet,
                 no_clones,
                 rescan,
+                replace_overlapping,
                 cross_device,
                 min_free,
                 exclude,
