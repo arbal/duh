@@ -124,6 +124,49 @@ def test_file_children_freeable_semantics(server):
     assert data_bin["total_blocks"] > 0
 
 
+def _serve_with_open_stub(scanned, tmp_path, *extra_args):
+    """Start `duh serve` with a stub `open` shadowing the real one on PATH
+    (so no actual browser is ever launched) and return (proc, port, log)."""
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    log = tmp_path / "open.log"
+    stub = stub_dir / "open"
+    stub.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
+    stub.chmod(0o755)
+    port = _free_port()
+    proc = subprocess.Popen(
+        [str(DUH_BIN), "serve", "--port", str(port), *extra_args],
+        env={"DUH_DB": str(scanned.db), "PATH": f"{stub_dir}:/usr/bin:/bin",
+             "HOME": "/tmp"},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return proc, port, log
+
+
+@rust_only
+def test_serve_auto_opens_browser(scanned, tmp_path):
+    proc, port, log = _serve_with_open_stub(scanned, tmp_path)
+    try:
+        _wait_port(port)
+        deadline = time.time() + 10
+        while time.time() < deadline and not log.exists():
+            time.sleep(0.1)
+        assert log.exists(), "`open` was never invoked"
+        assert f"http://127.0.0.1:{port}/" in log.read_text()
+    finally:
+        proc.terminate(); proc.wait(timeout=10)
+
+
+@rust_only
+def test_no_browser_suppresses_open(scanned, tmp_path):
+    proc, port, log = _serve_with_open_stub(scanned, tmp_path, "--no-browser")
+    try:
+        _wait_port(port)
+        time.sleep(0.5)  # would-be `open` happens before the listener loop
+        assert not log.exists(), log.read_text()
+    finally:
+        proc.terminate(); proc.wait(timeout=10)
+
+
 @rust_only
 def test_static_asset_content_types(server):
     expected = {

@@ -159,12 +159,21 @@ pub fn run(db_path: &Path, port: u16, no_browser: bool) -> ExitCode {
 
     // Auto-open the browser unless suppressed. Non-fatal on failure (a sanctioned
     // improvement over the oracle, which would crash if `open` were missing).
+    // `open` is resolved via PATH so tests can stub it, falling back to the
+    // absolute /usr/bin/open for minimal launch environments (e.g. launchd)
+    // whose PATH lacks /usr/bin — previously that failure was swallowed
+    // silently and no browser appeared.
     if !no_browser {
-        let _ = std::process::Command::new("open")
-            .arg(&url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        let spawn = |program: &str| {
+            std::process::Command::new(program)
+                .arg(&url)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        };
+        if let Err(e) = spawn("open").or_else(|_| spawn("/usr/bin/open")) {
+            eprintln!("[serve] could not open browser: {e}");
+        }
     }
 
     // Small thread pool: each worker owns a read-only connection and pulls
