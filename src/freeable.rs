@@ -121,10 +121,14 @@ fn load_cache(con: &Connection, scan_id: i64) -> rusqlite::Result<Option<Freeabl
     }
     let mut freeable = HashMap::new();
     let mut locked_here = HashMap::new();
-    let mut stmt = con
-        .prepare("SELECT node_id, freeable, locked_here FROM freeable_cache WHERE scan_id = ?")?;
+    let mut stmt =
+        con.prepare("SELECT node_id, freeable, locked_here FROM freeable_cache WHERE scan_id = ?")?;
     let rows = stmt.query_map([scan_id], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
     })?;
     for row in rows {
         let (nid, f, lh) = row?;
@@ -150,10 +154,7 @@ fn persist_cache(
     locked_here: &HashMap<i64, u64>,
 ) -> rusqlite::Result<()> {
     let tx = con.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM freeable_cache WHERE scan_id != ?",
-        [scan_id],
-    )?;
+    tx.execute("DELETE FROM freeable_cache WHERE scan_id != ?", [scan_id])?;
     let mut all_ids: HashSet<i64> = HashSet::with_capacity(freeable.len() + locked_here.len());
     all_ids.extend(freeable.keys());
     all_ids.extend(locked_here.keys());
@@ -205,7 +206,9 @@ pub fn compute(con: &Connection) -> rusqlite::Result<FreeableMaps> {
     // Phase 1: dense parent/depth/is_dir/excl_blocks arrays indexed by node_id.
     // ------------------------------------------------------------------
     let max_id: i64 = con
-        .query_row("SELECT MAX(id) FROM files", [], |r| r.get::<_, Option<i64>>(0))?
+        .query_row("SELECT MAX(id) FROM files", [], |r| {
+            r.get::<_, Option<i64>>(0)
+        })?
         .unwrap_or(0);
     let n = (max_id + 1) as usize;
 
@@ -281,7 +284,10 @@ pub fn compute(con: &Connection) -> rusqlite::Result<FreeableMaps> {
             "SELECT excluded_id, SUM(blocks_sum) FROM excluded_families GROUP BY excluded_id",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0)))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+            ))
         })?;
         for row in rows {
             let (eid, total) = row?;
@@ -307,7 +313,11 @@ pub fn compute(con: &Connection) -> rusqlite::Result<FreeableMaps> {
             "SELECT clone_id, id, size_blocks FROM files WHERE clone_id IS NOT NULL AND is_dir=0",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })?;
         for row in rows {
             let (cid, nid, blk) = row?;
@@ -316,9 +326,14 @@ pub fn compute(con: &Connection) -> rusqlite::Result<FreeableMaps> {
     }
     {
         // excluded_families pseudo-members: node_id = excluded_id, blocks = max_blocks.
-        let mut stmt = con.prepare("SELECT clone_id, excluded_id, max_blocks FROM excluded_families")?;
+        let mut stmt =
+            con.prepare("SELECT clone_id, excluded_id, max_blocks FROM excluded_families")?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })?;
         for row in rows {
             let (cid, eid, blk) = row?;
@@ -368,7 +383,10 @@ pub fn compute(con: &Connection) -> rusqlite::Result<FreeableMaps> {
         })?;
         for row in rows {
             let (dev, ino, nid, nlinks, blk) = row?;
-            hl_fam.entry((dev, ino)).or_default().push((nid, nlinks, blk));
+            hl_fam
+                .entry((dev, ino))
+                .or_default()
+                .push((nid, nlinks, blk));
         }
     }
     for members in hl_fam.values() {
@@ -1113,9 +1131,12 @@ fn print_marginal_leaks(con: &Connection, root_id: i64) -> rusqlite::Result<()> 
             ext
         } else {
             // Hardlink branch keeps query order (the reference filters a list).
-            let mut stmt = con
-                .prepare("SELECT id FROM files WHERE dev = ? AND ino = ? AND nlinks > 1 AND id != ?")?;
-            let rows = stmt.query_map(params![cand.dev, cand.ino, cand.fid], |r| r.get::<_, i64>(0))?;
+            let mut stmt = con.prepare(
+                "SELECT id FROM files WHERE dev = ? AND ino = ? AND nlinks > 1 AND id != ?",
+            )?;
+            let rows = stmt.query_map(params![cand.dev, cand.ino, cand.fid], |r| {
+                r.get::<_, i64>(0)
+            })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
                 .into_iter()
                 .filter(|id| !inside_ids.contains(id))
@@ -1171,7 +1192,8 @@ pub fn cmd_file(con: &Connection, path: &str) -> rusqlite::Result<ExitCode> {
     let row = con
         .query_row(
             "SELECT size_logical, size_blocks, ino, dev, nlinks, clone_id, mtime, \
-                    is_excluded, excluded_file_count FROM files WHERE id = ?",
+                    is_excluded, excluded_file_count, private_size, ext_flags, clone_refcnt \
+                    FROM files WHERE id = ?",
             [file_id],
             |r| {
                 Ok((
@@ -1184,12 +1206,27 @@ pub fn cmd_file(con: &Connection, path: &str) -> rusqlite::Result<ExitCode> {
                     r.get::<_, i64>(6)?,
                     r.get::<_, i64>(7)?,
                     r.get::<_, Option<i64>>(8)?,
+                    r.get::<_, Option<i64>>(9)?,
+                    r.get::<_, Option<i64>>(10)?,
+                    r.get::<_, Option<i64>>(11)?,
                 ))
             },
         )
         .optional()?;
-    let Some((size_logical, size_blocks, ino, dev, nlinks, clone_id, mtime, is_excluded, excl_count)) =
-        row
+    let Some((
+        size_logical,
+        size_blocks,
+        ino,
+        dev,
+        nlinks,
+        clone_id,
+        mtime,
+        is_excluded,
+        excl_count,
+        private_size,
+        ext_flags,
+        clone_refcnt,
+    )) = row
     else {
         eprintln!("error: file not in DB: {real_str}");
         return Ok(ExitCode::FAILURE);
@@ -1206,11 +1243,44 @@ pub fn cmd_file(con: &Connection, path: &str) -> rusqlite::Result<ExitCode> {
         fmt_bytes(size_blocks),
         commafy(size_blocks)
     );
+    println!(
+        "  private_size:  {}",
+        private_size.map_or_else(
+            || "None".to_string(),
+            |v| format!("{} ({} bytes)", fmt_bytes(v), commafy(v))
+        )
+    );
+
+    let mut flags_strs = Vec::new();
+    if let Some(flags) = ext_flags {
+        if flags & 0x00000001 != 0 {
+            flags_strs.push("EF_MAY_SHARE_BLOCKS");
+        }
+        if flags & 0x00000040 != 0 {
+            flags_strs.push("EF_SHARES_ALL_BLOCKS");
+        }
+    }
+    let flags_display = ext_flags.map_or_else(
+        || "None".to_string(),
+        |v| {
+            if flags_strs.is_empty() {
+                format!("{v}")
+            } else {
+                format!("{v} ({})", flags_strs.join(", "))
+            }
+        },
+    );
+    println!("  ext_flags:     {}", flags_display);
+
     println!("  inode:         {ino}  dev={dev}");
     println!("  nlinks:        {nlinks}");
     println!(
         "  clone_id:      {}",
         clone_id.map_or_else(|| "None".to_string(), |c| c.to_string())
+    );
+    println!(
+        "  clone_refcnt:  {}",
+        clone_refcnt.map_or_else(|| "None".to_string(), |c| c.to_string())
     );
     println!("  mtime:         {}", ctime(mtime));
     if is_excluded != 0 {
@@ -1231,8 +1301,7 @@ pub fn cmd_file(con: &Connection, path: &str) -> rusqlite::Result<ExitCode> {
 
     if let Some(cid) = clone_id {
         let family: Vec<i64> = {
-            let mut stmt =
-                con.prepare("SELECT id FROM files WHERE clone_id = ? AND id != ?")?;
+            let mut stmt = con.prepare("SELECT id FROM files WHERE clone_id = ? AND id != ?")?;
             let rows = stmt.query_map(params![cid, file_id], |r| r.get::<_, i64>(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
@@ -1249,8 +1318,7 @@ pub fn cmd_file(con: &Connection, path: &str) -> rusqlite::Result<ExitCode> {
 
     if nlinks > 1 {
         let hl_family: Vec<i64> = {
-            let mut stmt =
-                con.prepare("SELECT id FROM files WHERE dev=? AND ino=? AND id != ?")?;
+            let mut stmt = con.prepare("SELECT id FROM files WHERE dev=? AND ino=? AND id != ?")?;
             let rows = stmt.query_map(params![dev, ino, file_id], |r| r.get::<_, i64>(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
