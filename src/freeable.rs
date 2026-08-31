@@ -20,8 +20,18 @@ use std::os::unix::ffi::OsStrExt;
 
 use crate::scan::realpath;
 
-/// `(freeable, locked_here)` maps keyed by node_id (blocks).
-type FreeableMaps = (HashMap<i64, u64>, HashMap<i64, u64>);
+/// Explicit accounting dimensions keyed by directory node ID (bytes).
+#[derive(Debug, Default)]
+pub struct AccountingMaps {
+    /// Bytes proven reclaimable by deleting the represented subtree.
+    pub guaranteed: HashMap<i64, u64>,
+    /// Full-clone bytes conditionally reclaimable after required live members disappear.
+    pub conditional_shared: HashMap<i64, u64>,
+    /// Bytes that cannot be safely classified from the scan metadata.
+    pub uncertain: HashMap<i64, u64>,
+    pub locked_guaranteed_here: HashMap<i64, u64>,
+    pub locked_conditional_here: HashMap<i64, u64>,
+}
 
 /// Hardlink families grouped by `(dev, ino)` -> `[(node_id, nlinks, blocks)]`.
 type HlFam = HashMap<(i64, i64), Vec<(i64, i64, i64)>>;
@@ -110,7 +120,7 @@ fn get_latest_scan_id(con: &Connection) -> rusqlite::Result<Option<i64>> {
 /// Try to load freeable results from cache. Returns `(freeable, locked_here)` or
 /// `None` when there is no cache for `scan_id`. Only non-zero columns populate
 /// their map, matching the reference's truthiness filter.
-fn load_cache(con: &Connection, scan_id: i64) -> rusqlite::Result<Option<FreeableMaps>> {
+fn load_cache(con: &Connection, scan_id: i64) -> rusqlite::Result<Option<AccountingMaps>> {
     let cnt: i64 = con.query_row(
         "SELECT COUNT(*) FROM freeable_cache WHERE scan_id = ?",
         [scan_id],
@@ -119,27 +129,28 @@ fn load_cache(con: &Connection, scan_id: i64) -> rusqlite::Result<Option<Freeabl
     if cnt == 0 {
         return Ok(None);
     }
-    let mut freeable = HashMap::new();
-    let mut locked_here = HashMap::new();
+    let mut out = AccountingMaps::default();
     let mut stmt =
-        con.prepare("SELECT node_id, freeable, locked_here FROM freeable_cache WHERE scan_id = ?")?;
+        con.prepare("SELECT node_id, guaranteed, conditional_shared, uncertain, locked_guaranteed_here, locked_conditional_here FROM freeable_cache WHERE scan_id = ?")?;
     let rows = stmt.query_map([scan_id], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, i64>(1)?,
             r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, i64>(5)?,
         ))
     })?;
     for row in rows {
-        let (nid, f, lh) = row?;
-        if f != 0 {
-            freeable.insert(nid, f as u64);
-        }
-        if lh != 0 {
-            locked_here.insert(nid, lh as u64);
-        }
+        let (nid, g, c, u, lg, lc) = row?;
+        if g != 0 { out.guaranteed.insert(nid, g as u64); }
+        if c != 0 { out.conditional_shared.insert(nid, c as u64); }
+        if u != 0 { out.uncertain.insert(nid, u as u64); }
+        if lg != 0 { out.locked_guaranteed_here.insert(nid, lg as u64); }
+        if lc != 0 { out.locked_conditional_here.insert(nid, lc as u64); }
     }
-    Ok(Some((freeable, locked_here)))
+    Ok(Some(out))
 }
 
 /// Write freeable results to `freeable_cache`, clearing stale rows for other
@@ -150,25 +161,25 @@ fn load_cache(con: &Connection, scan_id: i64) -> rusqlite::Result<Option<Freeabl
 fn persist_cache(
     con: &Connection,
     scan_id: i64,
-    freeable: &HashMap<i64, u64>,
-    locked_here: &HashMap<i64, u64>,
+    accounting: &AccountingMaps,
 ) -> rusqlite::Result<()> {
     let tx = con.unchecked_transaction()?;
     tx.execute("DELETE FROM freeable_cache WHERE scan_id != ?", [scan_id])?;
-    let mut all_ids: HashSet<i64> = HashSet::with_capacity(freeable.len() + locked_here.len());
-    all_ids.extend(freeable.keys());
-    all_ids.extend(locked_here.keys());
+    let mut all_ids: HashSet<i64> = HashSet::new();
+    for m in [&accounting.guaranteed, &accounting.conditional_shared, &accounting.uncertain, &accounting.locked_guaranteed_here, &accounting.locked_conditional_here] { all_ids.extend(m.keys()); }
 
     {
         let mut stmt = tx.prepare(
-            "INSERT OR REPLACE INTO freeable_cache (node_id, freeable, locked_here, scan_id) \
-             VALUES (?,?,?,?)",
+            "INSERT OR REPLACE INTO freeable_cache (node_id, freeable, locked_here, guaranteed, conditional_shared, uncertain, locked_guaranteed_here, locked_conditional_here, accounting_status, scan_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
         )?;
         for nid in all_ids {
-            let f = freeable.get(&nid).copied().unwrap_or(0);
-            let lh = locked_here.get(&nid).copied().unwrap_or(0);
-            if f != 0 || lh != 0 {
-                stmt.execute(params![nid, f as i64, lh as i64, scan_id])?;
+            let g = accounting.guaranteed.get(&nid).copied().unwrap_or(0);
+            let c = accounting.conditional_shared.get(&nid).copied().unwrap_or(0);
+            let u = accounting.uncertain.get(&nid).copied().unwrap_or(0);
+            let lg = accounting.locked_guaranteed_here.get(&nid).copied().unwrap_or(0);
+            let lc = accounting.locked_conditional_here.get(&nid).copied().unwrap_or(0);
+            if g != 0 || c != 0 || u != 0 || lg != 0 || lc != 0 {
+                stmt.execute(params![nid, g as i64, lg as i64, g as i64, c as i64, u as i64, lg as i64, lc as i64, "v4", scan_id])?;
             }
         }
     }
@@ -193,7 +204,7 @@ struct LockedContrib {
 /// `(freeable, locked_here)` keyed by node_id (blocks). Loads from
 /// `freeable_cache` when valid for the latest scan_id, otherwise computes from
 /// scratch and persists non-zero rows.
-pub fn compute(con: &Connection) -> rusqlite::Result<FreeableMaps> {
+pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
     // Phase 0: cache.
     let scan_id = get_latest_scan_id(con)?;
     if let Some(sid) = scan_id {
@@ -541,13 +552,18 @@ pub fn compute(con: &Connection) -> rusqlite::Result<FreeableMaps> {
     // Phase 10: persist. A persist failure (locked/read-only DB) is downgraded
     // to a stderr warning, matching the oracle: the freeable numbers must still
     // print even when the cache cannot be written.
+    let accounting = AccountingMaps {
+        guaranteed: freeable,
+        locked_guaranteed_here: locked_here,
+        ..AccountingMaps::default()
+    };
     if let Some(sid) = scan_id {
-        if let Err(e) = persist_cache(con, sid, &freeable, &locked_here) {
+        if let Err(e) = persist_cache(con, sid, &accounting) {
             eprintln!("[freeable] warning: could not write cache: {e}");
         }
     }
 
-    Ok((freeable, locked_here))
+    Ok(accounting)
 }
 
 /// Finalize one family (clone or hardlink): compute the incremental LCA over
@@ -765,9 +781,9 @@ pub fn cmd_freeable(con: &Connection, path: &str, json: bool) -> rusqlite::Resul
         return Ok(ExitCode::FAILURE);
     };
 
-    let (freeable, locked_here) = compute(con)?;
-    let f = freeable.get(&node_id).copied().unwrap_or(0);
-    let lh = locked_here.get(&node_id).copied().unwrap_or(0);
+    let accounting = compute(con)?;
+    let f = accounting.guaranteed.get(&node_id).copied().unwrap_or(0);
+    let lh = accounting.locked_guaranteed_here.get(&node_id).copied().unwrap_or(0);
 
     if json {
         // Rust-side addition (the reference `freeable` subcommand has no
@@ -776,6 +792,9 @@ pub fn cmd_freeable(con: &Connection, path: &str, json: bool) -> rusqlite::Resul
             "path": real.to_string_lossy(),
             "freeable": f,
             "locked_here": lh,
+            "guaranteed": f,
+            "conditional_shared": accounting.conditional_shared.get(&node_id).copied().unwrap_or(0),
+            "uncertain": accounting.uncertain.get(&node_id).copied().unwrap_or(0),
         });
         println!("{}", serde_json::to_string_pretty(&out).expect("serialize"));
         return Ok(ExitCode::SUCCESS);

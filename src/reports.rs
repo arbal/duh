@@ -455,7 +455,9 @@ pub fn cmd_clusters(
     limit: i64,
     json: bool,
 ) -> rusqlite::Result<ExitCode> {
-    let (freeable_map, locked_here_map) = compute_freeable(con)?;
+    let accounting = compute_freeable(con)?;
+    let freeable_map = accounting.guaranteed;
+    let locked_here_map = accounting.locked_guaranteed_here;
 
     let mut ranked: Vec<(i64, u64)> = locked_here_map.into_iter().collect();
     // Stable descending sort by locked_here. (The reference sorts a

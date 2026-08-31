@@ -102,13 +102,15 @@ pub fn run(db_path: &Path, port: u16, no_browser: bool) -> ExitCode {
     };
 
     eprintln!("[serve] computing freeable metrics...");
-    let (freeable_map, locked_here_map) = match freeable::compute(&con) {
+    let accounting = match freeable::compute(&con) {
         Ok(maps) => maps,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let freeable_map = accounting.guaranteed;
+    let locked_here_map = accounting.locked_guaranteed_here;
     let scan_root: Option<PathBuf> = con
         .query_row("SELECT root FROM scans ORDER BY id DESC LIMIT 1", [], |r| {
             r.get::<_, String>(0)
