@@ -69,6 +69,7 @@ const VLNK: u32 = 5; // vnode.h:85
 /// The attribute set requested for bulk directory reads. Every one of these is
 /// packed into the output buffer at a fixed position thanks to
 /// `FSOPT_PACK_INVAL_ATTRS`; the returned `attribute_set_t` tells us which are valid.
+#[cfg(target_os = "macos")]
 fn bulk_attrlist() -> libc::attrlist {
     libc::attrlist {
         bitmapcount: ATTR_BIT_MAP_COUNT,
@@ -271,6 +272,7 @@ fn lstat_sizes(path: &Path) -> Option<(u32, u64, u64)> {
 }
 
 /// Bulk-read directory entries via `getattrlistbulk`. Does not include `.`/`..`.
+#[cfg(target_os = "macos")]
 pub fn read_dir_attrs(dir: &Path) -> std::io::Result<Vec<EntryAttrs>> {
     let f = std::fs::File::open(dir)?; // O_RDONLY dirfd
     let attrs = bulk_attrlist();
@@ -328,8 +330,39 @@ pub fn read_dir_attrs(dir: &Path) -> std::io::Result<Vec<EntryAttrs>> {
     Ok(out)
 }
 
+/// Portable fallback used on non-macOS hosts. APFS-only fields are absent, but
+/// ordinary POSIX metadata remains available for development and fixture tests.
+#[cfg(not(target_os = "macos"))]
+pub fn read_dir_attrs(dir: &Path) -> std::io::Result<Vec<EntryAttrs>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let md = std::fs::symlink_metadata(&path)?;
+        let ft = md.file_type();
+        let (nlink, size_logical, size_blocks) = lstat_sizes(&path).unwrap_or((1, md.len(), 0));
+        out.push(EntryAttrs {
+            name: entry.file_name(),
+            is_dir: ft.is_dir(),
+            is_symlink: ft.is_symlink(),
+            dev: md.dev() as i32,
+            ino: md.ino(),
+            nlink,
+            size_logical,
+            size_blocks,
+            mtime: md.mtime(),
+            clone_id: None,
+            private_size: None,
+            ext_flags: None,
+            clone_refcnt: None,
+        });
+    }
+    Ok(out)
+}
+
 /// Return the APFS clone ID for `path`, or `None` if unavailable/unsupported.
 /// Direct port of the oracle's single-path `getattrlist` binding (`reference/duh-py:74-115`).
+#[cfg(target_os = "macos")]
 pub fn get_clone_id(path: &Path) -> Option<u64> {
     let cpath = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
 
@@ -378,6 +411,12 @@ pub fn get_clone_id(path: &Path) -> Option<u64> {
     } else {
         Some(clone_id)
     }
+}
+
+/// APFS clone metadata is unavailable on non-macOS hosts.
+#[cfg(not(target_os = "macos"))]
+pub fn get_clone_id(_path: &Path) -> Option<u64> {
+    None
 }
 
 /// Stat a single path (typically a scan root) into an [`EntryAttrs`], following

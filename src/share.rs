@@ -473,7 +473,7 @@ mod tests {
         let con = Connection::open_in_memory().unwrap();
         con.execute_batch(crate::db::SCHEMA).unwrap();
         con.execute(
-            "INSERT INTO scans (id, root, started_at, schema_version) VALUES (1,'/',0,3)",
+            "INSERT INTO scans (id, root, started_at, schema_version) VALUES (1,'/',0,4)",
             [],
         )
         .unwrap();

@@ -867,8 +867,8 @@ fn run_inner(
     // Create the scans row first so finished_at can always be set on abort.
     let started_at = now_secs();
     con.execute(
-        "INSERT INTO scans (root, started_at, schema_version) VALUES (?, ?, 3)",
-        rusqlite::params![RawText(root_bytes), started_at],
+        "INSERT INTO scans (root, started_at, schema_version) VALUES (?, ?, ?)",
+        rusqlite::params![RawText(root_bytes), started_at, crate::db::SCHEMA_VERSION],
     )?;
     let scan_id = con.last_insert_rowid();
 
