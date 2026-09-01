@@ -1496,6 +1496,49 @@ pub fn cmd_file(con: &Connection, path: &str) -> rusqlite::Result<ExitCode> {
 mod tests {
     use super::*;
 
+    fn test_db() -> Connection {
+        let con = Connection::open_in_memory().unwrap();
+        con.execute_batch(crate::db::SCHEMA).unwrap();
+        con.execute(
+            "INSERT INTO scans(id,root,started_at,schema_version) VALUES(1,'/fixture',0,4)",
+            [],
+        )
+        .unwrap();
+        con
+    }
+
+    fn add_file(
+        con: &Connection,
+        id: i64,
+        parent_id: Option<i64>,
+        is_dir: i64,
+        dev: i64,
+        ino: i64,
+        clone_id: Option<i64>,
+        nlinks: i64,
+        blocks: i64,
+        private_size: Option<i64>,
+        ext_flags: Option<i64>,
+        clone_refcnt: Option<i64>,
+    ) {
+        con.execute(
+            "INSERT INTO files(id,parent_id,name,is_dir,is_symlink,is_excluded,dev,ino,clone_id,
+             nlinks,size_logical,size_blocks,mtime,private_size,ext_flags,clone_refcnt,scan_id)
+             VALUES(?,?,?,?,0,0,?,?,?,?,?,?,0,?,?,?,1)",
+            rusqlite::params![
+                id, parent_id, format!("n{id}"), is_dir, dev, ino, clone_id, nlinks, blocks,
+                blocks, private_size, ext_flags, clone_refcnt
+            ],
+        )
+        .unwrap();
+    }
+
+    fn add_tree(con: &Connection) {
+        add_file(con, 1, None, 1, 1, 1, None, 1, 0, None, None, None);
+        add_file(con, 2, Some(1), 1, 1, 2, None, 1, 0, None, None, None);
+        add_file(con, 3, Some(1), 1, 1, 3, None, 1, 0, None, None, None);
+    }
+
     #[test]
     fn fmt_bytes_matches_reference() {
         assert_eq!(fmt_bytes(0), "0 B");
@@ -1577,5 +1620,40 @@ mod tests {
         let two = LockedContrib { lca: 1, credit: 11, child_set: [2, 3].into_iter().collect() };
         let result = materialize_locked(&[one, two], &parent, 4);
         assert_eq!(result.get(&1), Some(&11));
+    }
+
+    #[test]
+    fn compute_separates_full_clone_bytes_as_conditional() {
+        let con = test_db();
+        add_tree(&con);
+        add_file(&con, 4, Some(2), 0, 2, 4, Some(9), 1, 100, None, Some(EF_SHARES_ALL_BLOCKS), Some(2));
+        add_file(&con, 5, Some(3), 0, 2, 5, Some(9), 1, 100, None, Some(EF_SHARES_ALL_BLOCKS), Some(2));
+        let result = compute(&con).unwrap();
+        assert_eq!(result.guaranteed.get(&1), None);
+        assert_eq!(result.conditional_shared.get(&1), Some(&100));
+        assert_eq!(result.locked_conditional_here.get(&1), Some(&100));
+    }
+
+    #[test]
+    fn compute_splits_partial_clone_bytes_conservatively() {
+        let con = test_db();
+        add_tree(&con);
+        add_file(&con, 4, Some(2), 0, 2, 4, Some(9), 1, 100, Some(20), Some(EF_MAY_SHARE_BLOCKS), Some(2));
+        add_file(&con, 5, Some(3), 0, 2, 5, Some(9), 1, 100, Some(20), Some(EF_MAY_SHARE_BLOCKS), Some(2));
+        let result = compute(&con).unwrap();
+        assert_eq!(result.guaranteed.get(&1), Some(&40));
+        assert_eq!(result.uncertain.get(&1), Some(&160));
+        assert_eq!(result.locked_guaranteed_here.get(&1), Some(&40));
+    }
+
+    #[test]
+    fn compute_counts_hardlink_private_bytes_once() {
+        let con = test_db();
+        add_tree(&con);
+        add_file(&con, 4, Some(2), 0, 2, 4, None, 2, 100, Some(100), None, None);
+        add_file(&con, 5, Some(3), 0, 2, 4, None, 2, 100, Some(100), None, None);
+        let result = compute(&con).unwrap();
+        assert_eq!(result.guaranteed.get(&1), Some(&100));
+        assert_eq!(result.locked_guaranteed_here.get(&1), Some(&100));
     }
 }
