@@ -33,8 +33,84 @@ pub struct AccountingMaps {
     pub locked_conditional_here: HashMap<i64, u64>,
 }
 
-/// Hardlink families grouped by `(dev, ino)` -> `[(node_id, nlinks, blocks)]`.
-type HlFam = HashMap<(i64, i64), Vec<(i64, i64, i64)>>;
+/// Hardlink families grouped by `(dev, ino)` -> `[(node_id, nlinks, blocks, private)]`.
+type HlFam = HashMap<(i64, i64), Vec<(i64, i64, i64, Option<i64>)>>;
+
+const EF_MAY_SHARE_BLOCKS: i64 = 0x0000_0001;
+const EF_SHARES_ALL_BLOCKS: i64 = 0x0000_0040;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloneClass {
+    FullConditional(i64),
+    Partial { guaranteed: i64, uncertain: i64 },
+    Unknown { uncertain: i64 },
+}
+
+#[derive(Debug, Clone)]
+struct CloneMember {
+    node_id: i64,
+    blocks: i64,
+    dev: i64,
+    ino: i64,
+    nlinks: i64,
+    private_size: Option<i64>,
+    ext_flags: Option<i64>,
+    clone_refcnt: Option<i64>,
+}
+
+/// Classify a clone family before topology credit is assigned. The family is
+/// deduplicated by inode so hardlink aliases cannot inflate clone_refcnt or
+/// private-byte credit. Missing or inconsistent metadata is conservative.
+fn classify_clone(members: &[CloneMember]) -> CloneClass {
+    let mut unique: HashMap<(i64, i64), &CloneMember> = HashMap::new();
+    for member in members {
+        unique.entry((member.dev, member.ino)).or_insert(member);
+    }
+    let unique_members: Vec<&CloneMember> = unique.values().copied().collect();
+    let uncertain_total: i64 = unique_members.iter().map(|m| m.blocks.max(0)).sum();
+
+    let all_full = unique_members.iter().all(|m| {
+        m.nlinks == 1
+            && m.ext_flags.is_some_and(|f| f & EF_SHARES_ALL_BLOCKS != 0)
+            && m.clone_refcnt.is_some()
+    });
+    let refcnt = unique_members.first().and_then(|m| m.clone_refcnt);
+    let refs_agree = unique_members.iter().all(|m| m.clone_refcnt == refcnt);
+    if all_full && refs_agree {
+        if let Some(refcnt) = refcnt {
+            if refcnt == unique_members.len() as i64 {
+                return CloneClass::FullConditional(
+                    unique_members.iter().map(|m| m.blocks.max(0)).max().unwrap_or(0),
+                );
+            }
+            // A live clone outside the scan means the shared blocks are not
+            // provably reclaimable inside this represented tree.
+            if refcnt > unique_members.len() as i64 {
+                return CloneClass::Unknown { uncertain: uncertain_total };
+            }
+        }
+    }
+
+    let partial = unique_members.iter().any(|m| {
+        m.ext_flags.is_some_and(|f| f & EF_MAY_SHARE_BLOCKS != 0)
+            && !m.ext_flags.is_some_and(|f| f & EF_SHARES_ALL_BLOCKS != 0)
+    });
+    if partial {
+        let mut guaranteed = 0;
+        let mut uncertain = 0;
+        for member in unique_members {
+            match member.private_size {
+                Some(private) if private >= 0 && private <= member.blocks.max(0) => {
+                    guaranteed += private;
+                    uncertain += member.blocks.max(0) - private;
+                }
+                _ => uncertain += member.blocks.max(0),
+            }
+        }
+        return CloneClass::Partial { guaranteed, uncertain };
+    }
+    CloneClass::Unknown { uncertain: uncertain_total }
+}
 
 /// Bind a raw byte string as a SQLite TEXT value (names are stored as bytes; see
 /// `scan.rs`'s identical helper). Kept private here to avoid widening `scan`'s API.
@@ -308,7 +384,11 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
 
     // credit[i] = direct credit assigned to node i.
     let mut credit = vec![0i64; n];
+    let mut conditional_credit = vec![0i64; n];
+    let mut uncertain_credit = vec![0i64; n];
     let mut locked_contrib: Vec<LockedContrib> = Vec::new();
+    let mut conditional_locked_contrib: Vec<LockedContrib> = Vec::new();
+    let mut uncertain_locked_contrib: Vec<LockedContrib> = Vec::new();
 
     // ------------------------------------------------------------------
     // Phase 3+4: clone families. Union of real file members and excluded
@@ -317,26 +397,38 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
     // union — independent of whether every member is in-tree. That set drives
     // the singleton pass below.
     // ------------------------------------------------------------------
-    // clone_id -> Vec<(node_id, blocks)>.
-    let mut clone_fam: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
+    // clone_id -> metadata-rich members. Classification happens before LCA
+    // placement so clone and hardlink semantics are not conflated.
+    let mut clone_fam: HashMap<i64, Vec<CloneMember>> = HashMap::new();
     {
         let mut stmt = con.prepare(
-            "SELECT clone_id, id, size_blocks FROM files WHERE clone_id IS NOT NULL AND is_dir=0",
+            "SELECT clone_id, id, size_blocks, dev, ino, nlinks, private_size, ext_flags, clone_refcnt \
+             FROM files WHERE clone_id IS NOT NULL AND is_dir=0",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, Option<i64>>(8)?,
             ))
         })?;
         for row in rows {
-            let (cid, nid, blk) = row?;
-            clone_fam.entry(cid).or_default().push((nid, blk));
+            let (cid, nid, blk, dev, ino, nlinks, private_size, ext_flags, clone_refcnt) = row?;
+            clone_fam.entry(cid).or_default().push(CloneMember {
+                node_id: nid, blocks: blk, dev, ino, nlinks, private_size, ext_flags, clone_refcnt,
+            });
         }
     }
     {
-        // excluded_families pseudo-members: node_id = excluded_id, blocks = max_blocks.
+        // Excluded pseudo-members lack per-file APFS metadata, so they force a
+        // conservative unknown classification rather than reusing max_blocks
+        // as if the subtree had been fully classified.
         let mut stmt =
             con.prepare("SELECT clone_id, excluded_id, max_blocks FROM excluded_families")?;
         let rows = stmt.query_map([], |r| {
@@ -348,7 +440,10 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
         })?;
         for row in rows {
             let (cid, eid, blk) = row?;
-            clone_fam.entry(cid).or_default().push((eid, blk));
+            clone_fam.entry(cid).or_default().push(CloneMember {
+                node_id: eid, blocks: blk, dev: -1, ino: eid, nlinks: 1,
+                private_size: None, ext_flags: None, clone_refcnt: None,
+            });
         }
     }
 
@@ -360,28 +455,34 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
         }
         multi_cids.insert(*cid);
 
-        let max_blk = members.iter().map(|&(_, b)| b).max().unwrap_or(0);
-        finalize_family(
-            members.iter().map(|&(nid, _)| nid),
-            max_blk,
-            &depth,
-            &parent,
-            max_id,
-            &mut credit,
-            &mut locked_contrib,
-        );
+        match classify_clone(members) {
+            CloneClass::FullConditional(credit_blk) => finalize_family(
+                members.iter().map(|m| m.node_id), credit_blk, &depth, &parent,
+                max_id, &mut conditional_credit, &mut conditional_locked_contrib,
+            ),
+            CloneClass::Partial { guaranteed, uncertain } => {
+                finalize_family(members.iter().map(|m| m.node_id), guaranteed, &depth, &parent,
+                    max_id, &mut credit, &mut locked_contrib);
+                finalize_family(members.iter().map(|m| m.node_id), uncertain, &depth, &parent,
+                    max_id, &mut uncertain_credit, &mut uncertain_locked_contrib);
+            }
+            CloneClass::Unknown { uncertain } => finalize_family(
+                members.iter().map(|m| m.node_id), uncertain, &depth, &parent,
+                max_id, &mut uncertain_credit, &mut uncertain_locked_contrib,
+            ),
+        }
     }
 
     // ------------------------------------------------------------------
     // Phase 5: hardlink families, grouped by (dev, ino). Files carrying a
     // clone_id are excluded (treated as clones above).
     // ------------------------------------------------------------------
-    // (dev, ino) -> Vec<(node_id, nlinks, blocks)>.
+    // (dev, ino) -> Vec<(node_id, nlinks, blocks, private_size)>.
     let mut hl_fam: HlFam = HashMap::new();
     {
         let mut stmt = con.prepare(
-            "SELECT dev, ino, id, nlinks, size_blocks FROM files \
-             WHERE is_dir=0 AND clone_id IS NULL AND nlinks > 1",
+            "SELECT dev, ino, id, nlinks, size_blocks, private_size FROM files \
+             WHERE is_dir=0 AND nlinks > 1",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -390,14 +491,15 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(5)?,
             ))
         })?;
         for row in rows {
-            let (dev, ino, nid, nlinks, blk) = row?;
+            let (dev, ino, nid, nlinks, blk, private) = row?;
             hl_fam
                 .entry((dev, ino))
                 .or_default()
-                .push((nid, nlinks, blk));
+                .push((nid, nlinks, blk, private));
         }
     }
     for members in hl_fam.values() {
@@ -409,10 +511,15 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
             // External links present — conservatively credit nothing.
             continue;
         }
-        // All members in DB: credit inode blocks once (any member — same inode).
-        let credit_blk = members[0].2;
+        // All members in DB: credit private inode bytes once. If APFS metadata
+        // is absent, retain the legacy allocation-size behavior for portable
+        // fixture databases; native APFS scans supply private_size.
+        let credit_blk = members[0].3.unwrap_or(members[0].2);
+        if members.iter().any(|m| m.3.is_some() && m.3 != Some(credit_blk)) {
+            continue;
+        }
         finalize_family(
-            members.iter().map(|&(nid, _, _)| nid),
+            members.iter().map(|&(nid, _, _, _)| nid),
             credit_blk,
             &depth,
             &parent,
@@ -485,6 +592,8 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
         }
     }
     let mut subtree = vec![0i64; n];
+    let mut conditional_subtree = vec![0i64; n];
+    let mut uncertain_subtree = vec![0i64; n];
     for d in (0..=max_depth).rev() {
         for &nid in &buckets[d as usize] {
             match is_dir[nid as usize] {
@@ -493,6 +602,8 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
                     let pid = parent[nid as usize];
                     if pid > 0 && pid <= max_id {
                         subtree[pid as usize] += credit[nid as usize] + subtree[nid as usize];
+                        conditional_subtree[pid as usize] += conditional_credit[nid as usize] + conditional_subtree[nid as usize];
+                        uncertain_subtree[pid as usize] += uncertain_credit[nid as usize] + uncertain_subtree[nid as usize];
                     }
                 }
                 2 => {
@@ -500,6 +611,8 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
                     let pid = parent[nid as usize];
                     if pid > 0 && pid <= max_id {
                         subtree[pid as usize] += credit[nid as usize];
+                        conditional_subtree[pid as usize] += conditional_credit[nid as usize];
+                        uncertain_subtree[pid as usize] += uncertain_credit[nid as usize];
                     }
                 }
                 _ => {}
@@ -511,12 +624,18 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
     // Phase 9: materialise freeable + locked_here (non-zero only).
     // ------------------------------------------------------------------
     let mut freeable: HashMap<i64, u64> = HashMap::new();
+    let mut conditional_shared: HashMap<i64, u64> = HashMap::new();
+    let mut uncertain: HashMap<i64, u64> = HashMap::new();
     for nid in 1..=max_id {
         if is_dir[nid as usize] > 0 {
             let val = credit[nid as usize] + subtree[nid as usize];
+            let conditional = conditional_credit[nid as usize] + conditional_subtree[nid as usize];
+            let unknown = uncertain_credit[nid as usize] + uncertain_subtree[nid as usize];
             if val != 0 {
                 freeable.insert(nid, val as u64);
             }
+            if conditional != 0 { conditional_shared.insert(nid, conditional as u64); }
+            if unknown != 0 { uncertain.insert(nid, unknown as u64); }
         }
     }
 
@@ -554,6 +673,8 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
     // print even when the cache cannot be written.
     let accounting = AccountingMaps {
         guaranteed: freeable,
+        conditional_shared,
+        uncertain,
         locked_guaranteed_here: locked_here,
         ..AccountingMaps::default()
     };
