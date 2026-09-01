@@ -15,6 +15,17 @@ def freeable_of(scanned, path):
     return (row[0], row[1]) if row else (0, 0)
 
 
+def accounting_of(scanned, path):
+    run_duh("freeable", path, db=scanned.db)
+    con = sqlite3.connect(scanned.db)
+    nid = node_id_for(con, path, scanned.root)
+    row = con.execute(
+        "SELECT guaranteed, conditional_shared, uncertain, "
+        "locked_guaranteed_here, locked_conditional_here "
+        "FROM freeable_cache WHERE node_id = ?", (nid,)).fetchone()
+    return row or (0, 0, 0, 0, 0)
+
+
 def test_clone_dir_with_member_outside_frees_nothing(scanned):
     # family LCA is the root; deleting clones/ leaves big.bin holding the blocks
     f, _ = freeable_of(scanned, scanned.root / "clones")
@@ -22,11 +33,12 @@ def test_clone_dir_with_member_outside_frees_nothing(scanned):
 
 
 def test_sibling_family_credits_lca(scanned):
-    f_x, _ = freeable_of(scanned, scanned.root / "siblings/x")
-    f_sib, lh_sib = freeable_of(scanned, scanned.root / "siblings")
-    assert approx(f_x, 0)
-    assert approx(f_sib, EXPECT["family_siblings"])
-    assert approx(lh_sib, EXPECT["family_siblings"])
+    a_x = accounting_of(scanned, scanned.root / "siblings/x")
+    a_sib = accounting_of(scanned, scanned.root / "siblings")
+    assert approx(a_x[0], 0)
+    assert approx(a_sib[0], 0)
+    assert approx(a_sib[1], EXPECT["family_siblings"])
+    assert approx(a_sib[4], EXPECT["family_siblings"])
 
 
 def test_hardlink_family_counted_once(scanned):
@@ -41,10 +53,14 @@ def test_unique_dir_fully_freeable(scanned):
 
 def test_root_freeable_counts_each_family_once(scanned):
     f, _ = freeable_of(scanned, scanned.root)
-    expected = (EXPECT["family_big"] + EXPECT["family_siblings"]
-                + EXPECT["hardlinks"] + EXPECT["unique"]
+    expected = (EXPECT["hardlinks"] + EXPECT["unique"]
                 + EXPECT["sparse_alloc"] + (1 << 20))  # + excluded node_modules
     assert approx(f, expected, tol=1 << 20)
+
+
+def test_root_conditional_accounts_for_clone_families(scanned):
+    accounting = accounting_of(scanned, scanned.root)
+    assert approx(accounting[1], EXPECT["family_big"] + EXPECT["family_siblings"])
 
 
 def test_freeable_cli_output_shape(scanned):

@@ -1,9 +1,10 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-/// Verbatim from the reference oracle `reference/duh-py` lines 295-341 (`_init_schema`'s `executescript` block)
-/// plus the `freeable_cache` table DDL from `reference/duh-py` lines 1617-1623
-/// (`_persist_freeable_cache`'s `executescript` block). Do not "improve" this SQL.
+/// Schema version for the APFS-aware accounting cache.
+pub const SCHEMA_VERSION: i64 = 4;
+
+/// The scan schema, extended with explicit v4 accounting dimensions.
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS scans (
   id INTEGER PRIMARY KEY,
@@ -14,7 +15,7 @@ CREATE TABLE IF NOT EXISTS scans (
   excluded_count INTEGER,
   bytes_logical INTEGER,
   bytes_blocks INTEGER,
-  schema_version INTEGER DEFAULT 2
+  schema_version INTEGER DEFAULT 4
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -32,6 +33,9 @@ CREATE TABLE IF NOT EXISTS files (
   size_blocks INTEGER NOT NULL,
   excluded_file_count INTEGER,
   mtime INTEGER NOT NULL,
+  private_size INTEGER,
+  ext_flags INTEGER,
+  clone_refcnt INTEGER,
   scan_id INTEGER NOT NULL REFERENCES scans(id),
   UNIQUE(parent_id, name)
 );
@@ -55,6 +59,12 @@ CREATE TABLE IF NOT EXISTS freeable_cache (
   node_id INTEGER PRIMARY KEY,
   freeable INTEGER NOT NULL,
   locked_here INTEGER NOT NULL,
+  guaranteed INTEGER NOT NULL DEFAULT 0,
+  conditional_shared INTEGER NOT NULL DEFAULT 0,
+  uncertain INTEGER NOT NULL DEFAULT 0,
+  locked_guaranteed_here INTEGER NOT NULL DEFAULT 0,
+  locked_conditional_here INTEGER NOT NULL DEFAULT 0,
+  accounting_status TEXT NOT NULL DEFAULT 'v4',
   scan_id INTEGER NOT NULL
 );
 "#;
@@ -84,11 +94,49 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     con.pragma_update(None, "synchronous", "NORMAL")?;
     con.pragma_update(None, "foreign_keys", "ON")?;
     con.execute_batch(SCHEMA)?;
+    validate_schema(&con)?;
     Ok(con)
+}
+
+/// Reject an old database instead of allowing a stale v3 cache to masquerade
+/// as v4 accounting. A database with no scans is valid and can be populated by
+/// the current scanner.
+fn validate_schema(con: &Connection) -> rusqlite::Result<()> {
+    let latest: Option<i64> = con
+        .query_row("SELECT schema_version FROM scans ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+        .optional()?;
+    if let Some(version) = latest {
+        if version != SCHEMA_VERSION {
+            return Err(schema_error(format!(
+                "database schema v{version} is not supported; rescan/rebuild required for v{SCHEMA_VERSION}"
+            )));
+        }
+    }
+    let columns: std::collections::HashSet<String> = con
+        .prepare("PRAGMA table_info(freeable_cache)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    for required in ["guaranteed", "conditional_shared", "uncertain", "locked_guaranteed_here", "locked_conditional_here", "accounting_status"] {
+        if !columns.contains(required) {
+            return Err(schema_error(format!(
+                "database lacks v4 column {required}; rescan/rebuild required"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn schema_error(message: String) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_SCHEMA),
+        Some(message),
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::Connection;
+
     #[test]
     fn schema_applies_and_tables_exist() {
         let tmp = std::env::temp_dir().join(format!("duh-test-{}.db", std::process::id()));
@@ -103,6 +151,40 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "missing table {t}");
         }
+        let columns: std::collections::HashSet<String> = con
+            .prepare("PRAGMA table_info(freeable_cache)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for required in [
+            "guaranteed",
+            "conditional_shared",
+            "uncertain",
+            "locked_guaranteed_here",
+            "locked_conditional_here",
+            "accounting_status",
+        ] {
+            assert!(columns.contains(required), "missing v4 column {required}");
+        }
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn stale_schema_reports_an_actionable_schema_error() {
+        let con = Connection::open_in_memory().unwrap();
+        con.execute_batch(
+            "CREATE TABLE scans (id INTEGER PRIMARY KEY, schema_version INTEGER); \
+             CREATE TABLE freeable_cache (node_id INTEGER, freeable INTEGER, locked_here INTEGER); \
+             INSERT INTO scans(id, schema_version) VALUES (1, 3);",
+        )
+        .unwrap();
+
+        let err = super::validate_schema(&con).unwrap_err();
+        assert!(
+            err.to_string().contains("rescan/rebuild required"),
+            "unexpected stale-schema error: {err:?}"
+        );
     }
 }

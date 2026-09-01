@@ -13,7 +13,9 @@ def test_clones_lists_family(scanned):
 
 def test_clusters_finds_sibling_group(scanned):
     out = run_duh("clusters", "--min-bytes", str(1 << 20), db=scanned.db).stdout
-    assert "siblings" in out
+    # v4 clusters intentionally report only guaranteed locked bytes; shared
+    # clone families remain in the conditional accounting dimension.
+    assert "hardlinks" in out
 
 
 def test_excluded_lists_node_modules(scanned):
@@ -23,4 +25,3 @@ def test_excluded_lists_node_modules(scanned):
 
 def test_stats_runs(scanned):
     assert run_duh("stats", db=scanned.db).returncode == 0
-

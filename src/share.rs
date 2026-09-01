@@ -45,9 +45,7 @@ pub struct ShareResult {
 /// aggregates) has more than one member — the same set the freeable engine uses
 /// to zero out a shared file's own freeable. Ported from the spike's
 /// `MULTI_CLONE` query.
-pub fn multi_clone_set(
-    con: &rusqlite::Connection,
-) -> rusqlite::Result<HashSet<i64>> {
+pub fn multi_clone_set(con: &rusqlite::Connection) -> rusqlite::Result<HashSet<i64>> {
     let mut stmt = con.prepare(
         "SELECT clone_id FROM (\
            SELECT clone_id FROM files WHERE clone_id IS NOT NULL AND is_dir=0 \
@@ -96,8 +94,7 @@ pub fn build_share(
     let (arena, seq) = build_reveal_sequence(inp, node_id, node_path, root_size)?;
 
     let tot_q3 = q3(root_size);
-    let Some((k, fragment)) = fit_budget(&arena, &seq, budget, node_path, scan_date, tot_q3)
-    else {
+    let Some((k, fragment)) = fit_budget(&arena, &seq, budget, node_path, scan_date, tot_q3) else {
         return Ok(None);
     };
     let tree = encode_tree(&arena, 0, k);
@@ -148,10 +145,7 @@ struct HeapItem {
     tie: Reverse<u64>,
 }
 
-fn children_of(
-    con: &rusqlite::Connection,
-    parent_id: i64,
-) -> rusqlite::Result<Vec<ChildRow>> {
+fn children_of(con: &rusqlite::Connection, parent_id: i64) -> rusqlite::Result<Vec<ChildRow>> {
     let mut stmt = con.prepare(
         "SELECT id, name, is_dir, size_blocks, clone_id, nlinks FROM files WHERE parent_id=?",
     )?;
@@ -176,9 +170,7 @@ fn size_of(row: &ChildRow, inp: &ShareInput) -> i64 {
     if row.is_dir {
         return inp.freeable_map.get(&row.id).copied().unwrap_or(0) as i64;
     }
-    let clone_shared = row
-        .clone_id
-        .is_some_and(|c| inp.multi_clone.contains(&c));
+    let clone_shared = row.clone_id.is_some_and(|c| inp.multi_clone.contains(&c));
     if row.nlinks > 1 || clone_shared {
         0
     } else {
@@ -311,8 +303,13 @@ fn push_children(
     // Take the leading run of children at or above the fraction threshold, but
     // never fewer than the floor nor more than the ceiling.
     let threshold = (parent_size as f64 * SHARE_MIN_FRACTION) as u64;
-    let above = eligible.iter().take_while(|(sz, _)| *sz >= threshold).count();
-    let take = above.clamp(SHARE_MIN_FANOUT, SHARE_MAX_FANOUT).min(eligible.len());
+    let above = eligible
+        .iter()
+        .take_while(|(sz, _)| *sz >= threshold)
+        .count();
+    let take = above
+        .clamp(SHARE_MIN_FANOUT, SHARE_MAX_FANOUT)
+        .min(eligible.len());
     for (sz, row) in eligible.into_iter().take(take) {
         let tie = cands.len() as u64;
         cands.push(Cand {
@@ -386,8 +383,7 @@ fn encode_tree(arena: &[RNode], idx: usize, k: usize) -> Value {
         .filter(|&c| visible(arena, c, k))
         .collect();
     if !vis.is_empty() {
-        let mut enc_kids: Vec<Value> =
-            vis.iter().map(|&c| encode_tree(arena, c, k)).collect();
+        let mut enc_kids: Vec<Value> = vis.iter().map(|&c| encode_tree(arena, c, k)).collect();
         let sum: u64 = vis.iter().map(|&c| arena[c].size).sum();
         let hidden = arena[cur].size.saturating_sub(sum);
         if (hidden as f64) > arena[cur].size as f64 * 0.005 {
@@ -477,7 +473,7 @@ mod tests {
         let con = Connection::open_in_memory().unwrap();
         con.execute_batch(crate::db::SCHEMA).unwrap();
         con.execute(
-            "INSERT INTO scans (id, root, started_at, schema_version) VALUES (1,'/',0,2)",
+            "INSERT INTO scans (id, root, started_at, schema_version) VALUES (1,'/',0,4)",
             [],
         )
         .unwrap();
@@ -498,9 +494,20 @@ mod tests {
         con.execute(
             "INSERT INTO files \
              (id, parent_id, name, is_dir, is_symlink, is_excluded, dev, ino, \
-              clone_id, nlinks, size_logical, size_blocks, mtime, scan_id) \
-             VALUES (?,?,?,?,0,0,1,?,?,?,?,?,0,1)",
-            params![id, parent, name, is_dir, id, clone_id, nlinks, size_blocks, size_blocks],
+              clone_id, nlinks, size_logical, size_blocks, mtime, private_size, \
+              ext_flags, clone_refcnt, scan_id) \
+             VALUES (?,?,?,?,0,0,1,?,?,?,?,?,0,NULL,NULL,NULL,1)",
+            params![
+                id,
+                parent,
+                name,
+                is_dir,
+                id,
+                clone_id,
+                nlinks,
+                size_blocks,
+                size_blocks
+            ],
         )
         .unwrap();
     }
@@ -662,7 +669,11 @@ mod tests {
             let res = build_share(&inp, 1, "root", "2026-07-15", budget)
                 .unwrap()
                 .unwrap();
-            assert!(res.chars <= budget, "fragment {} > budget {budget}", res.chars);
+            assert!(
+                res.chars <= budget,
+                "fragment {} > budget {budget}",
+                res.chars
+            );
             assert_eq!(res.chars, res.fragment.len());
             let doc = decode(&res.fragment);
             let mut names = HashSet::new();
@@ -717,7 +728,10 @@ mod tests {
         let n = &doc["n"];
         assert_eq!(n[0].as_str(), Some("a/b/c"));
         assert_eq!(node_size(n), q3(MB as u64));
-        assert!(node_kids(n).is_empty(), "collapsed chain leaf has no children");
+        assert!(
+            node_kids(n).is_empty(),
+            "collapsed chain leaf has no children"
+        );
     }
 
     #[test]
@@ -746,7 +760,16 @@ mod tests {
         // Terminal unique file under the last dir, sized to match it exactly
         // (no extra residue at the final hop).
         let leaf_size = *sizes.last().unwrap() as i64;
-        ins(&con, LEVELS + 1, Some(LEVELS), "leaf", 0, leaf_size, None, 1);
+        ins(
+            &con,
+            LEVELS + 1,
+            Some(LEVELS),
+            "leaf",
+            0,
+            leaf_size,
+            None,
+            1,
+        );
 
         let mut fm = HashMap::new();
         for (i, &s) in sizes.iter().enumerate() {
@@ -822,7 +845,16 @@ mod tests {
             ins(&con, 10 + i, Some(1), &format!("big{i}"), 0, big, None, 1);
         }
         for i in 0..5 {
-            ins(&con, 100 + i, Some(1), &format!("tiny{i}"), 0, tiny, None, 1);
+            ins(
+                &con,
+                100 + i,
+                Some(1),
+                &format!("tiny{i}"),
+                0,
+                tiny,
+                None,
+                1,
+            );
         }
         let mut fm = HashMap::new();
         fm.insert(1, (5 * big + 5 * tiny) as u64);
@@ -840,7 +872,11 @@ mod tests {
         let kids = node_kids(&doc["n"]);
 
         let non_star: Vec<&Value> = kids.iter().filter(|k| k[0].as_str() != Some("*")).collect();
-        assert_eq!(non_star.len(), 5, "the five ≥0.3% children must reveal: {kids:?}");
+        assert_eq!(
+            non_star.len(),
+            5,
+            "the five ≥0.3% children must reveal: {kids:?}"
+        );
         assert!(
             non_star.iter().all(|k| node_size(k) == q3(big as u64)),
             "revealed children are all the big ones"
@@ -901,7 +937,16 @@ mod tests {
         ins(&con, 1, None, "root", 1, 0, None, 1);
         let sizes: [i64; 3] = [50 * MB, 30 * MB, 20 * MB];
         for (i, &sz) in sizes.iter().enumerate() {
-            ins(&con, 10 + i as i64, Some(1), &format!("f{i}"), 0, sz, None, 1);
+            ins(
+                &con,
+                10 + i as i64,
+                Some(1),
+                &format!("f{i}"),
+                0,
+                sz,
+                None,
+                1,
+            );
         }
         let mut fm = HashMap::new();
         fm.insert(1, sizes.iter().sum::<i64>() as u64);

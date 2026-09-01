@@ -33,6 +33,9 @@ pub struct EntryAttrs {
     pub size_blocks: u64,
     pub mtime: i64,
     pub clone_id: Option<u64>,
+    pub private_size: Option<i64>,
+    pub ext_flags: Option<u64>,
+    pub clone_refcnt: Option<u32>,
 }
 
 // --- attr.h constants (verified against the SDK header; lines noted) ---------
@@ -49,7 +52,10 @@ const ATTR_FILE_LINKCOUNT: u32 = 0x0000_0001; // attr.h:532
 const ATTR_FILE_TOTALSIZE: u32 = 0x0000_0002; // attr.h:533
 const ATTR_FILE_ALLOCSIZE: u32 = 0x0000_0004; // attr.h:534
 
+const ATTR_CMNEXT_PRIVATESIZE: u32 = 0x0000_0008; // attr.h:553
 const ATTR_CMNEXT_CLONEID: u32 = 0x0000_0100; // attr.h:558 (== oracle empirical, reference/duh-py:49)
+const ATTR_CMNEXT_EXT_FLAGS: u32 = 0x0000_0200; // attr.h:559
+const ATTR_CMNEXT_CLONE_REFCNT: u32 = 0x0000_1000; // attr.h:562
 
 const FSOPT_NOFOLLOW: u32 = 0x0000_0001; // attr.h:46
 const FSOPT_PACK_INVAL_ATTRS: u32 = 0x0000_0008; // attr.h:50
@@ -63,6 +69,7 @@ const VLNK: u32 = 5; // vnode.h:85
 /// The attribute set requested for bulk directory reads. Every one of these is
 /// packed into the output buffer at a fixed position thanks to
 /// `FSOPT_PACK_INVAL_ATTRS`; the returned `attribute_set_t` tells us which are valid.
+#[cfg(target_os = "macos")]
 fn bulk_attrlist() -> libc::attrlist {
     libc::attrlist {
         bitmapcount: ATTR_BIT_MAP_COUNT,
@@ -77,7 +84,10 @@ fn bulk_attrlist() -> libc::attrlist {
         volattr: 0,
         dirattr: 0,
         fileattr: ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE,
-        forkattr: ATTR_CMNEXT_CLONEID, // extended common attr, lives in forkattr field
+        forkattr: ATTR_CMNEXT_PRIVATESIZE
+            | ATTR_CMNEXT_CLONEID
+            | ATTR_CMNEXT_EXT_FLAGS
+            | ATTR_CMNEXT_CLONE_REFCNT,
     }
 }
 
@@ -211,12 +221,31 @@ fn parse_record(rec: &[u8], dir: &Path) -> Option<EntryAttrs> {
     // files (reference/duh-py:463-468) — match that parity so clone-family logic (Task 9)
     // sees exactly what the reference does. Still consume the field to keep the
     // cursor aligned when present.
+    let private_size = if (ret_fork & ATTR_CMNEXT_PRIVATESIZE) != 0 {
+        Some(i64_at(rec, take!(8)))
+    } else {
+        None
+    };
+
     let raw_clone = if (ret_fork & ATTR_CMNEXT_CLONEID) != 0 {
         let cid = u64_at(rec, take!(8));
         (cid != 0).then_some(cid)
     } else {
         None
     };
+
+    let ext_flags = if (ret_fork & ATTR_CMNEXT_EXT_FLAGS) != 0 {
+        Some(u64_at(rec, take!(8)))
+    } else {
+        None
+    };
+
+    let clone_refcnt = if (ret_fork & ATTR_CMNEXT_CLONE_REFCNT) != 0 {
+        Some(u32_at(rec, take!(4)))
+    } else {
+        None
+    };
+
     let clone_id = if objtype == VREG { raw_clone } else { None };
 
     Some(EntryAttrs {
@@ -230,20 +259,20 @@ fn parse_record(rec: &[u8], dir: &Path) -> Option<EntryAttrs> {
         size_blocks,
         mtime,
         clone_id,
+        private_size,
+        ext_flags,
+        clone_refcnt,
     })
 }
 
 /// (nlink, size_logical, size_blocks) from a per-path `lstat`.
 fn lstat_sizes(path: &Path) -> Option<(u32, u64, u64)> {
     let md = std::fs::symlink_metadata(path).ok()?;
-    Some((
-        md.nlink() as u32,
-        md.size(),
-        md.blocks() * 512,
-    ))
+    Some((md.nlink() as u32, md.size(), md.blocks() * 512))
 }
 
 /// Bulk-read directory entries via `getattrlistbulk`. Does not include `.`/`..`.
+#[cfg(target_os = "macos")]
 pub fn read_dir_attrs(dir: &Path) -> std::io::Result<Vec<EntryAttrs>> {
     let f = std::fs::File::open(dir)?; // O_RDONLY dirfd
     let attrs = bulk_attrlist();
@@ -287,7 +316,10 @@ pub fn read_dir_attrs(dir: &Path) -> std::io::Result<Vec<EntryAttrs>> {
             }
             let rec = &buf[off..off + rec_len];
             if debug {
-                eprintln!("duh-debug: rec_len={rec_len} bytes={:02x?}", &rec[..rec_len.min(112)]);
+                eprintln!(
+                    "duh-debug: rec_len={rec_len} bytes={:02x?}",
+                    &rec[..rec_len.min(112)]
+                );
             }
             if let Some(e) = parse_record(rec, dir) {
                 out.push(e);
@@ -298,8 +330,39 @@ pub fn read_dir_attrs(dir: &Path) -> std::io::Result<Vec<EntryAttrs>> {
     Ok(out)
 }
 
+/// Portable fallback used on non-macOS hosts. APFS-only fields are absent, but
+/// ordinary POSIX metadata remains available for development and fixture tests.
+#[cfg(not(target_os = "macos"))]
+pub fn read_dir_attrs(dir: &Path) -> std::io::Result<Vec<EntryAttrs>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let md = std::fs::symlink_metadata(&path)?;
+        let ft = md.file_type();
+        let (nlink, size_logical, size_blocks) = lstat_sizes(&path).unwrap_or((1, md.len(), 0));
+        out.push(EntryAttrs {
+            name: entry.file_name(),
+            is_dir: ft.is_dir(),
+            is_symlink: ft.is_symlink(),
+            dev: md.dev() as i32,
+            ino: md.ino(),
+            nlink,
+            size_logical,
+            size_blocks,
+            mtime: md.mtime(),
+            clone_id: None,
+            private_size: None,
+            ext_flags: None,
+            clone_refcnt: None,
+        });
+    }
+    Ok(out)
+}
+
 /// Return the APFS clone ID for `path`, or `None` if unavailable/unsupported.
 /// Direct port of the oracle's single-path `getattrlist` binding (`reference/duh-py:74-115`).
+#[cfg(target_os = "macos")]
 pub fn get_clone_id(path: &Path) -> Option<u64> {
     let cpath = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
 
@@ -311,7 +374,10 @@ pub fn get_clone_id(path: &Path) -> Option<u64> {
         volattr: 0,
         dirattr: 0,
         fileattr: 0,
-        forkattr: ATTR_CMNEXT_CLONEID,
+        forkattr: ATTR_CMNEXT_PRIVATESIZE
+            | ATTR_CMNEXT_CLONEID
+            | ATTR_CMNEXT_EXT_FLAGS
+            | ATTR_CMNEXT_CLONE_REFCNT,
     };
     let mut out = [0u8; 64];
     let options = FSOPT_NOFOLLOW | FSOPT_PACK_INVAL_ATTRS | FSOPT_ATTR_CMN_EXTENDED;
@@ -347,6 +413,12 @@ pub fn get_clone_id(path: &Path) -> Option<u64> {
     }
 }
 
+/// APFS clone metadata is unavailable on non-macOS hosts.
+#[cfg(not(target_os = "macos"))]
+pub fn get_clone_id(_path: &Path) -> Option<u64> {
+    None
+}
+
 /// Stat a single path (typically a scan root) into an [`EntryAttrs`], following
 /// symlinks is NOT done — the root's own metadata is returned (lstat semantics).
 pub fn stat_root(path: &Path) -> std::io::Result<EntryAttrs> {
@@ -356,6 +428,10 @@ pub fn stat_root(path: &Path) -> std::io::Result<EntryAttrs> {
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_else(|| path.as_os_str().to_os_string());
+
+    // The root directory itself is not a clone-family member, so the bulk
+    // scanner's extended per-file metadata is not needed here. Keep the
+    // optional fields empty rather than adding a second single-path parser.
     let clone_id = if ft.is_file() {
         get_clone_id(path)
     } else {
@@ -374,5 +450,8 @@ pub fn stat_root(path: &Path) -> std::io::Result<EntryAttrs> {
         size_blocks: md.blocks() * 512,
         mtime: md.mtime(),
         clone_id,
+        private_size: None,
+        ext_flags: None,
+        clone_refcnt: None,
     })
 }

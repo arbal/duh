@@ -103,8 +103,8 @@ impl ToSql for RawText<'_> {
 const INSERT_SQL: &str = "\
 INSERT OR IGNORE INTO files
   (id, parent_id, name, is_dir, is_symlink, is_excluded, dev, ino, clone_id,
-   nlinks, size_logical, size_blocks, excluded_file_count, mtime, scan_id)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+   nlinks, size_logical, size_blocks, excluded_file_count, mtime, private_size, ext_flags, clone_refcnt, scan_id)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
 fn now_secs() -> f64 {
     SystemTime::now()
@@ -208,8 +208,14 @@ fn delete_scan_rows(con: &Connection, sid: i64) -> rusqlite::Result<()> {
          (SELECT id FROM files WHERE scan_id = ?)",
         rusqlite::params![sid],
     )?;
-    con.execute("DELETE FROM files WHERE scan_id = ?", rusqlite::params![sid])?;
-    con.execute("DELETE FROM freeable_cache WHERE scan_id = ?", rusqlite::params![sid])?;
+    con.execute(
+        "DELETE FROM files WHERE scan_id = ?",
+        rusqlite::params![sid],
+    )?;
+    con.execute(
+        "DELETE FROM freeable_cache WHERE scan_id = ?",
+        rusqlite::params![sid],
+    )?;
     con.execute("DELETE FROM scans WHERE id = ?", rusqlite::params![sid])?;
     Ok(())
 }
@@ -276,6 +282,9 @@ struct FileRow {
     size_logical: i64,
     size_blocks: i64,
     mtime: i64,
+    private_size: Option<i64>,
+    ext_flags: Option<u64>,
+    clone_refcnt: Option<u32>,
 }
 
 /// A directory row bound for the writer, plus any excluded-subtree clone families
@@ -294,6 +303,9 @@ struct DirRow {
     size_blocks: i64,
     excluded_file_count: Option<i64>,
     mtime: i64,
+    private_size: Option<i64>,
+    ext_flags: Option<u64>,
+    clone_refcnt: Option<u32>,
     families: Vec<(u64, i64, i64, i64)>,
 }
 
@@ -430,6 +442,9 @@ fn write_dir(con: &Connection, d: &DirRow, scan_id: i64) -> rusqlite::Result<()>
             d.size_blocks,
             d.excluded_file_count,
             d.mtime,
+            d.private_size,
+            d.ext_flags.map(|c| c as i64),
+            d.clone_refcnt,
             scan_id,
         ],
     )?;
@@ -530,6 +545,9 @@ fn worker(
                     size_blocks: agg_blocks,
                     excluded_file_count: Some(agg_count),
                     mtime: entry.mtime,
+                    private_size: None, // Excluded dirs aggregate and skip fetching this
+                    ext_flags: None,
+                    clone_refcnt: None,
                     families: fams,
                 };
                 if !try_send(tx, coord, Msg::Dir(d)) {
@@ -568,6 +586,9 @@ fn worker(
                     size_blocks: entry.size_blocks as i64,
                     excluded_file_count: None,
                     mtime: entry.mtime,
+                    private_size: entry.private_size,
+                    ext_flags: entry.ext_flags,
+                    clone_refcnt: entry.clone_refcnt,
                     families: Vec::new(),
                 };
                 if !try_send(tx, coord, Msg::Dir(d)) {
@@ -587,11 +608,20 @@ fn worker(
                     size_logical: entry.size_logical as i64,
                     size_blocks: entry.size_blocks as i64,
                     mtime: entry.mtime,
+                    private_size: entry.private_size,
+                    ext_flags: entry.ext_flags,
+                    clone_refcnt: entry.clone_refcnt,
                 });
                 totals.files.fetch_add(1, Ordering::Relaxed);
-                totals.logical.fetch_add(entry.size_logical as i64, Ordering::Relaxed);
-                totals.blocks.fetch_add(entry.size_blocks as i64, Ordering::Relaxed);
-                if batch.len() >= BATCH_SIZE && !try_send(tx, coord, Msg::Files(std::mem::take(&mut batch))) {
+                totals
+                    .logical
+                    .fetch_add(entry.size_logical as i64, Ordering::Relaxed);
+                totals
+                    .blocks
+                    .fetch_add(entry.size_blocks as i64, Ordering::Relaxed);
+                if batch.len() >= BATCH_SIZE
+                    && !try_send(tx, coord, Msg::Files(std::mem::take(&mut batch)))
+                {
                     break;
                 }
             }
@@ -635,7 +665,11 @@ fn writer(
         if !quiet && last_progress.elapsed().as_secs_f64() >= PROGRESS_INTERVAL {
             let files = totals.files.load(Ordering::Relaxed);
             let elapsed = scan_start.elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 { files as f64 / elapsed } else { 0.0 };
+            let rate = if elapsed > 0.0 {
+                files as f64 / elapsed
+            } else {
+                0.0
+            };
             eprintln!(
                 "[{} files, {} excluded, {} scanned, {:.0} files/sec]",
                 fmt_thousands(files),
@@ -688,6 +722,9 @@ fn writer(
                                 r.size_blocks,
                                 Option::<i64>::None, // excluded_file_count
                                 r.mtime,
+                                r.private_size,
+                                r.ext_flags.map(|c| c as i64),
+                                r.clone_refcnt,
                                 scan_id,
                             ])?;
                             rows_in_txn += 1;
@@ -776,9 +813,7 @@ fn run_inner(
         // CAST to BLOB: roots are stored as TEXT holding raw path bytes (see
         // RawText), and rusqlite only maps BLOB columns to Vec<u8>.
         let mut stmt = con.prepare("SELECT id, CAST(root AS BLOB) FROM scans")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
             .map(|(sid, raw)| (sid, PathBuf::from(std::ffi::OsString::from_vec(raw))))
@@ -832,8 +867,8 @@ fn run_inner(
     // Create the scans row first so finished_at can always be set on abort.
     let started_at = now_secs();
     con.execute(
-        "INSERT INTO scans (root, started_at, schema_version) VALUES (?, ?, 2)",
-        rusqlite::params![RawText(root_bytes), started_at],
+        "INSERT INTO scans (root, started_at, schema_version) VALUES (?, ?, ?)",
+        rusqlite::params![RawText(root_bytes), started_at, crate::db::SCHEMA_VERSION],
     )?;
     let scan_id = con.last_insert_rowid();
 
@@ -901,6 +936,9 @@ fn run_inner(
         size_blocks: root_stat.size_blocks as i64,
         excluded_file_count: None,
         mtime: root_stat.mtime,
+        private_size: root_stat.private_size,
+        ext_flags: root_stat.ext_flags,
+        clone_refcnt: root_stat.clone_refcnt,
         families: Vec::new(),
     };
     write_dir(&con, &root_dir, scan_id)?;
@@ -990,7 +1028,11 @@ fn run_inner(
     }
 
     let elapsed = now_secs() - started_at;
-    let rate = if elapsed > 0.0 { total_files as f64 / elapsed } else { 0.0 };
+    let rate = if elapsed > 0.0 {
+        total_files as f64 / elapsed
+    } else {
+        0.0
+    };
     if !args.quiet {
         eprintln!(
             "Scan complete: {} files, {} excluded dirs in {:.1}s ({:.0} files/sec)\n\
@@ -1019,15 +1061,33 @@ mod tests {
     #[test]
     fn roots_overlap_compares_path_components() {
         // equal
-        assert!(roots_overlap(Path::new("/Users/chang"), Path::new("/Users/chang")));
+        assert!(roots_overlap(
+            Path::new("/Users/chang"),
+            Path::new("/Users/chang")
+        ));
         // containment, both directions
-        assert!(roots_overlap(Path::new("/System/Volumes/Data"), Path::new("/System/Volumes/Data/Users")));
-        assert!(roots_overlap(Path::new("/Users/chang/projects"), Path::new("/Users/chang")));
+        assert!(roots_overlap(
+            Path::new("/System/Volumes/Data"),
+            Path::new("/System/Volumes/Data/Users")
+        ));
+        assert!(roots_overlap(
+            Path::new("/Users/chang/projects"),
+            Path::new("/Users/chang")
+        ));
         // string prefix but NOT a path prefix
-        assert!(!roots_overlap(Path::new("/Users/cha"), Path::new("/Users/chang")));
-        assert!(!roots_overlap(Path::new("/Users/chang"), Path::new("/Users/cha")));
+        assert!(!roots_overlap(
+            Path::new("/Users/cha"),
+            Path::new("/Users/chang")
+        ));
+        assert!(!roots_overlap(
+            Path::new("/Users/chang"),
+            Path::new("/Users/cha")
+        ));
         // siblings
-        assert!(!roots_overlap(Path::new("/Users/chang/a"), Path::new("/Users/chang/b")));
+        assert!(!roots_overlap(
+            Path::new("/Users/chang/a"),
+            Path::new("/Users/chang/b")
+        ));
     }
 
     /// Pin parity with Python's `{n:,}` formatting (used at reference/duh-py:780,822,829).
