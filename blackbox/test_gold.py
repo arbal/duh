@@ -7,7 +7,7 @@ import time
 import pytest
 
 from conftest import Scanned, build_tree, run_duh
-from test_freeable import freeable_of
+from test_freeable import accounting_of
 
 
 def free_bytes(path) -> int:
@@ -30,7 +30,12 @@ def test_rm_rf_matches_prediction(apfs_volume, tmp_path, victim, also_outside):
     scanned = Scanned(db=db, root=root)
 
     target = root / victim
-    predicted, _ = freeable_of(scanned, target)
+    guaranteed, conditional, _uncertain, _, _ = accounting_of(scanned, target)
+    # Deleting the whole target can realize a clone family's conditional bytes,
+    # while the legacy `freeable` projection intentionally reports only bytes
+    # guaranteed for the represented subtree alone. A family member left
+    # outside the target remains conditional and must not be counted here.
+    predicted = guaranteed + (conditional if not also_outside else 0)
 
     before = free_bytes(apfs_volume)
     shutil.rmtree(target)

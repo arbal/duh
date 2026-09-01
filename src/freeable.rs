@@ -458,7 +458,8 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
             .filter(|m| m.dev >= 0)
             .map(|m| (m.dev, m.ino))
             .collect();
-        if distinct_inodes.len() < 2 {
+        let has_excluded_member = members.iter().any(|m| m.dev < 0);
+        if distinct_inodes.len() < 2 && !has_excluded_member {
             // APFS reports the same clone_id for hardlink aliases. They are
             // an inode family, not a clone family, and must be handled below.
             continue;
@@ -1673,5 +1674,23 @@ mod tests {
         let result = compute(&con).unwrap();
         assert_eq!(result.guaranteed.get(&1), Some(&100));
         assert_eq!(result.locked_guaranteed_here.get(&1), Some(&100));
+    }
+
+    #[test]
+    fn excluded_clone_member_prevents_guaranteed_singleton_credit() {
+        let con = test_db();
+        add_tree(&con);
+        add_file(&con, 4, Some(2), 0, 2, 4, Some(9), 1, 100, None, Some(EF_SHARES_ALL_BLOCKS), Some(2));
+        add_file(&con, 6, Some(1), 2, 2, 6, None, 1, 100, None, None, None);
+        con.execute(
+            "INSERT INTO excluded_families(excluded_id,clone_id,member_count,blocks_sum,max_blocks)
+             VALUES(6,9,1,100,100)",
+            [],
+        )
+        .unwrap();
+
+        let result = compute(&con).unwrap();
+        assert_eq!(result.guaranteed.get(&1), None);
+        assert_eq!(result.uncertain.get(&1), Some(&200));
     }
 }
