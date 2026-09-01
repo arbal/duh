@@ -932,6 +932,8 @@ pub fn cmd_freeable(con: &Connection, path: &str, json: bool) -> rusqlite::Resul
             "guaranteed": f,
             "conditional_shared": accounting.conditional_shared.get(&node_id).copied().unwrap_or(0),
             "uncertain": accounting.uncertain.get(&node_id).copied().unwrap_or(0),
+            "locked_guaranteed_here": lh,
+            "locked_conditional_here": accounting.locked_conditional_here.get(&node_id).copied().unwrap_or(0),
         });
         println!("{}", serde_json::to_string_pretty(&out).expect("serialize"));
         return Ok(ExitCode::SUCCESS);
