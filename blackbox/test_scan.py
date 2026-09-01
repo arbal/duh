@@ -15,7 +15,7 @@ def test_scan_completes_and_records_metadata(scanned):
     scan = con.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 1").fetchone()
     assert scan["root"] == str(scanned.root)
     assert scan["finished_at"] is not None
-    assert scan["schema_version"] == 2
+    assert scan["schema_version"] == 4
     assert scan["files_count"] > 0
 
 
