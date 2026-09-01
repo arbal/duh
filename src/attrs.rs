@@ -429,12 +429,9 @@ pub fn stat_root(path: &Path) -> std::io::Result<EntryAttrs> {
         .map(|n| n.to_os_string())
         .unwrap_or_else(|| path.as_os_str().to_os_string());
 
-    // In order to not re-implement getattrlist for a single path just for the extended fields,
-    // and since stat_root is only used on the root path where these don't matter as much for now,
-    // we'll just populate clone_id by making get_clone_id still return just the clone_id for now,
-    // or we could change get_clone_id to return all the extended fields.
-    // For now we just stick to what was here, and set the new ones to None since they are Optional
-    // and we are stat-ing the root directory.
+    // The root directory itself is not a clone-family member, so the bulk
+    // scanner's extended per-file metadata is not needed here. Keep the
+    // optional fields empty rather than adding a second single-path parser.
     let clone_id = if ft.is_file() {
         get_clone_id(path)
     } else {
