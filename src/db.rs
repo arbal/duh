@@ -107,7 +107,7 @@ fn validate_schema(con: &Connection) -> rusqlite::Result<()> {
         .optional()?;
     if let Some(version) = latest {
         if version != SCHEMA_VERSION {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
+            return Err(schema_error(format!(
                 "database schema v{version} is not supported; rescan/rebuild required for v{SCHEMA_VERSION}"
             )));
         }
@@ -118,7 +118,7 @@ fn validate_schema(con: &Connection) -> rusqlite::Result<()> {
         .collect::<rusqlite::Result<_>>()?;
     for required in ["guaranteed", "conditional_shared", "uncertain", "locked_guaranteed_here", "locked_conditional_here", "accounting_status"] {
         if !columns.contains(required) {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
+            return Err(schema_error(format!(
                 "database lacks v4 column {required}; rescan/rebuild required"
             )));
         }
@@ -126,8 +126,17 @@ fn validate_schema(con: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn schema_error(message: String) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_SCHEMA),
+        Some(message),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use rusqlite::Connection;
+
     #[test]
     fn schema_applies_and_tables_exist() {
         let tmp = std::env::temp_dir().join(format!("duh-test-{}.db", std::process::id()));
@@ -160,5 +169,22 @@ mod tests {
             assert!(columns.contains(required), "missing v4 column {required}");
         }
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn stale_schema_reports_an_actionable_schema_error() {
+        let con = Connection::open_in_memory().unwrap();
+        con.execute_batch(
+            "CREATE TABLE scans (id INTEGER PRIMARY KEY, schema_version INTEGER); \
+             CREATE TABLE freeable_cache (node_id INTEGER, freeable INTEGER, locked_here INTEGER); \
+             INSERT INTO scans(id, schema_version) VALUES (1, 3);",
+        )
+        .unwrap();
+
+        let err = super::validate_schema(&con).unwrap_err();
+        assert!(
+            err.to_string().contains("rescan/rebuild required"),
+            "unexpected stale-schema error: {err:?}"
+        );
     }
 }

@@ -453,6 +453,16 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
             // Singleton family — handled in the singleton pass.
             continue;
         }
+        let distinct_inodes: HashSet<(i64, i64)> = members
+            .iter()
+            .filter(|m| m.dev >= 0)
+            .map(|m| (m.dev, m.ino))
+            .collect();
+        if distinct_inodes.len() < 2 {
+            // APFS reports the same clone_id for hardlink aliases. They are
+            // an inode family, not a clone family, and must be handled below.
+            continue;
+        }
         multi_cids.insert(*cid);
 
         match classify_clone(members) {
@@ -474,14 +484,16 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
     }
 
     // ------------------------------------------------------------------
-    // Phase 5: hardlink families, grouped by (dev, ino). Files carrying a
-    // clone_id are excluded (treated as clones above).
+    // Phase 5: hardlink families, grouped by (dev, ino). Clone IDs are not
+    // sufficient to exclude a row: APFS also reports the same clone_id for
+    // hardlink aliases. Only IDs classified as distinct-inode clone families
+    // above are excluded.
     // ------------------------------------------------------------------
     // (dev, ino) -> Vec<(node_id, nlinks, blocks, private_size)>.
     let mut hl_fam: HlFam = HashMap::new();
     {
         let mut stmt = con.prepare(
-            "SELECT dev, ino, id, nlinks, size_blocks, private_size FROM files \
+            "SELECT dev, ino, id, clone_id, nlinks, size_blocks, private_size FROM files \
              WHERE is_dir=0 AND nlinks > 1",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -489,13 +501,17 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
                 r.get::<_, i64>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
+                r.get::<_, Option<i64>>(3)?,
                 r.get::<_, i64>(4)?,
-                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<i64>>(6)?,
             ))
         })?;
         for row in rows {
-            let (dev, ino, nid, nlinks, blk, private) = row?;
+            let (dev, ino, nid, clone_id, nlinks, blk, private) = row?;
+            if clone_id.is_some_and(|cid| multi_cids.contains(&cid)) {
+                continue;
+            }
             hl_fam
                 .entry((dev, ino))
                 .or_default()
