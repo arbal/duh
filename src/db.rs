@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS scans (
   excluded_count INTEGER,
   bytes_logical INTEGER,
   bytes_blocks INTEGER,
-  schema_version INTEGER DEFAULT 2
+  schema_version INTEGER DEFAULT 3
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS files (
   size_blocks INTEGER NOT NULL,
   excluded_file_count INTEGER,
   mtime INTEGER NOT NULL,
+  private_size INTEGER,
+  ext_flags INTEGER,
+  clone_refcnt INTEGER,
   scan_id INTEGER NOT NULL REFERENCES scans(id),
   UNIQUE(parent_id, name)
 );
