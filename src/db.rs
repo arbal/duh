@@ -142,6 +142,23 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "missing table {t}");
         }
+        let columns: std::collections::HashSet<String> = con
+            .prepare("PRAGMA table_info(freeable_cache)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for required in [
+            "guaranteed",
+            "conditional_shared",
+            "uncertain",
+            "locked_guaranteed_here",
+            "locked_conditional_here",
+            "accounting_status",
+        ] {
+            assert!(columns.contains(required), "missing v4 column {required}");
+        }
         std::fs::remove_file(&tmp).ok();
     }
 }

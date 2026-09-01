@@ -641,8 +641,42 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
 
     // locked_here: resolve each contribution's child_set to *distinct direct
     // children* of the LCA (excluding the LCA itself); credit only when >= 2.
-    let mut locked_here: HashMap<i64, u64> = HashMap::new();
-    for lc in &locked_contrib {
+    let locked_here = materialize_locked(&locked_contrib, &parent, max_id);
+    let locked_conditional_here =
+        materialize_locked(&conditional_locked_contrib, &parent, max_id);
+
+    // Phase 10: persist. A persist failure (locked/read-only DB) is downgraded
+    // to a stderr warning, matching the oracle: the freeable numbers must still
+    // print even when the cache cannot be written.
+    let accounting = AccountingMaps {
+        guaranteed: freeable,
+        conditional_shared,
+        uncertain,
+        locked_guaranteed_here: locked_here,
+        locked_conditional_here,
+        ..AccountingMaps::default()
+    };
+    if let Some(sid) = scan_id {
+        if let Err(e) = persist_cache(con, sid, &accounting) {
+            eprintln!("[freeable] warning: could not write cache: {e}");
+        }
+    }
+
+    Ok(accounting)
+}
+
+/// Convert family contributions into locked-at-LCA totals. A contribution is
+/// locked only when its members occupy at least two distinct direct children
+/// of the LCA. Unknown/uncertain contributions are intentionally not exposed
+/// as locked bytes because the schema has no corresponding dimension; they
+/// remain visible through `uncertain`.
+fn materialize_locked(
+    contributions: &[LockedContrib],
+    parent: &[i64],
+    max_id: i64,
+) -> HashMap<i64, u64> {
+    let mut locked = HashMap::new();
+    for lc in contributions {
         let mut direct: HashSet<i64> = HashSet::new();
         for &cs in &lc.child_set {
             if cs == lc.lca {
@@ -651,7 +685,6 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
             if cs > 0 && cs <= max_id && parent[cs as usize] == lc.lca {
                 direct.insert(cs);
             } else {
-                // Walk up to the direct child of the LCA.
                 let mut cur = cs;
                 while cur > 0 && cur <= max_id {
                     let p = parent[cur as usize];
@@ -664,27 +697,10 @@ pub fn compute(con: &Connection) -> rusqlite::Result<AccountingMaps> {
             }
         }
         if direct.len() >= 2 {
-            *locked_here.entry(lc.lca).or_insert(0) += lc.credit as u64;
+            *locked.entry(lc.lca).or_insert(0) += lc.credit as u64;
         }
     }
-
-    // Phase 10: persist. A persist failure (locked/read-only DB) is downgraded
-    // to a stderr warning, matching the oracle: the freeable numbers must still
-    // print even when the cache cannot be written.
-    let accounting = AccountingMaps {
-        guaranteed: freeable,
-        conditional_shared,
-        uncertain,
-        locked_guaranteed_here: locked_here,
-        ..AccountingMaps::default()
-    };
-    if let Some(sid) = scan_id {
-        if let Err(e) = persist_cache(con, sid, &accounting) {
-            eprintln!("[freeable] warning: could not write cache: {e}");
-        }
-    }
-
-    Ok(accounting)
+    locked
 }
 
 /// Finalize one family (clone or hardlink): compute the incremental LCA over
@@ -1513,5 +1529,53 @@ mod tests {
         assert_eq!(direct_child_of_arr(1, 4, &parent), 2);
         assert_eq!(direct_child_of_arr(1, 6, &parent), 3);
         assert_eq!(direct_child_of_arr(2, 5, &parent), 5);
+    }
+
+    fn member(
+        node_id: i64,
+        blocks: i64,
+        dev: i64,
+        ino: i64,
+        nlinks: i64,
+        private_size: Option<i64>,
+        ext_flags: Option<i64>,
+        clone_refcnt: Option<i64>,
+    ) -> CloneMember {
+        CloneMember { node_id, blocks, dev, ino, nlinks, private_size, ext_flags, clone_refcnt }
+    }
+
+    #[test]
+    fn clone_classifier_requires_proof_for_full_clone_credit() {
+        let members = vec![
+            member(1, 100, 1, 10, 1, None, Some(EF_SHARES_ALL_BLOCKS), Some(2)),
+            member(2, 100, 1, 11, 1, None, Some(EF_SHARES_ALL_BLOCKS), Some(2)),
+        ];
+        assert_eq!(classify_clone(&members), CloneClass::FullConditional(100));
+
+        let mut external = members.clone();
+        external[1].clone_refcnt = Some(3);
+        assert_eq!(classify_clone(&external), CloneClass::Unknown { uncertain: 200 });
+    }
+
+    #[test]
+    fn clone_classifier_deduplicates_inodes_and_splits_partial_bytes() {
+        let members = vec![
+            member(1, 100, 1, 10, 2, Some(20), Some(EF_MAY_SHARE_BLOCKS), Some(2)),
+            member(2, 100, 1, 10, 2, Some(20), Some(EF_MAY_SHARE_BLOCKS), Some(2)),
+            member(3, 100, 1, 11, 1, Some(20), Some(EF_MAY_SHARE_BLOCKS), Some(2)),
+        ];
+        assert_eq!(
+            classify_clone(&members),
+            CloneClass::Partial { guaranteed: 40, uncertain: 160 }
+        );
+    }
+
+    #[test]
+    fn materialize_locked_requires_two_direct_children() {
+        let parent = vec![-1, -1, 1, 1, 2];
+        let one = LockedContrib { lca: 1, credit: 7, child_set: [2].into_iter().collect() };
+        let two = LockedContrib { lca: 1, credit: 11, child_set: [2, 3].into_iter().collect() };
+        let result = materialize_locked(&[one, two], &parent, 4);
+        assert_eq!(result.get(&1), Some(&11));
     }
 }
