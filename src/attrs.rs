@@ -366,7 +366,9 @@ pub fn read_dir_attrs(dir: &Path) -> std::io::Result<Vec<EntryAttrs>> {
 pub fn get_clone_id(path: &Path) -> Option<u64> {
     let cpath = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
 
-    // attrlist requesting only ATTR_CMN_RETURNED_ATTRS + ATTR_CMNEXT_CLONEID.
+    // Keep this single-path request clone-ID-only so the fixed @24 payload
+    // offset below remains valid. The bulk reader separately requests and
+    // parses the other extended attributes.
     let attrs = libc::attrlist {
         bitmapcount: ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -374,10 +376,7 @@ pub fn get_clone_id(path: &Path) -> Option<u64> {
         volattr: 0,
         dirattr: 0,
         fileattr: 0,
-        forkattr: ATTR_CMNEXT_PRIVATESIZE
-            | ATTR_CMNEXT_CLONEID
-            | ATTR_CMNEXT_EXT_FLAGS
-            | ATTR_CMNEXT_CLONE_REFCNT,
+        forkattr: ATTR_CMNEXT_CLONEID,
     };
     let mut out = [0u8; 64];
     let options = FSOPT_NOFOLLOW | FSOPT_PACK_INVAL_ATTRS | FSOPT_ATTR_CMN_EXTENDED;
